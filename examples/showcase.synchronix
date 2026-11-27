@@ -1,0 +1,138 @@
+// SPDX-License-Identifier: Apache-2.0
+//
+// Copyright 2026 Synchronix Contributors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
+// Full license text: ../LICENSE
+// End-User License Agreement: ../EULA.md
+
+// ============================================================================
+// SYNCHRONIX FULL ARCHITECTURE SHOWCASE (examples/showcase.synchronix)
+// ============================================================================
+// Exercises EVERY phase & subsystem in the Synchronix Architecture Diagram:
+//   - Phase 1: Lexer, Parser, Sema, Type Inference, Generics <T>, Phi & Lambda
+//   - Phase 2: SUMIR, Ownership/Borrow, ARC Insertion, GC Root Tracking,
+//              Phi Static Proof Elimination, Lambda Closure Conversion,
+//              Constant Folding, Inlining, Dead Code Elimination
+//   - Phase 3: RegAlloc, Inst Scheduling, x86_64 / ARM64 / LLVM IR Codegen
+//   - Runtime: Unified ARC + Tracing GC + Arena + M:N Async Fibers + Stdlib
+// ============================================================================
+
+// Top-level Phi formal axiom (statically proven at compile time -> 0 cost!)
+phi math_axiom = (6 * 7) == 42
+
+// Generic function (Generics Resolution)
+func identity<T>(x: T) -> T {
+    return x
+}
+
+// Small pure leaf helper (Inlining candidate)
+func square(n: Int) -> Int {
+    return n * n
+}
+
+// Phi-verified function with precondition contract (requires -> runtime check)
+func safe_div(a: Int, b: Int) -> Int
+    requires b != 0
+{
+    prove a >= 0
+    return a / b
+}
+
+// Loop & control flow: iterative factorial
+func factorial(n: Int) -> Int {
+    var acc = 1
+    var i = 1
+    while i <= n {
+        acc = acc * i
+        i = i + 1
+    }
+    return acc
+}
+
+// Demonstrates deterministic ARC release + GC unrooting upon scope exit
+func scope_demo() -> Int {
+    let temp_arc = arc(777)
+    let temp_alias = temp_arc
+    val temp_gc = gc(888)
+    return temp_alias + temp_gc
+}
+
+// Kotlin-inspired async fiber executed by the M:N Async Scheduler
+async func worker(id: Int) -> Int {
+    let val_sq = square(id) + 10
+    return val_sq
+}
+
+func main() -> Int {
+    println("=== SYNCHRONIX NATIVE EXECUTION ===")
+
+    // 1. Swift-inspired ARC (Automatic Reference Counting)
+    let box = arc(42)
+    let alias = box
+    print("1. ARC box + alias  : ")
+    println(alias)
+
+    // 2. Kotlin-inspired Tracing GC (with automatic root tracking)
+    val managed = gc(100)
+    print("2. GC managed value : ")
+    println(managed)
+
+    // 3. Ownership & Borrow Checker
+    let owner = 77
+    let ref = borrow owner
+    print("3. Borrowed value   : ")
+    println(ref)
+
+    // 4. Lambda (Functional Logic) — Closure with Environment Capture & Pipe
+    let factor = 3
+    let scale = lambda (x: Int) => x * factor
+    let scaled = 14 |> scale
+    print("4. Lambda 14|>scale : ")
+    println(scaled)
+
+    // 5. Phi Formal Logic (static proof eliminated + runtime contract checked)
+    prove 10 + 32 == 42
+    let q = safe_div(84, 2)
+    print("5. Phi safe_div     : ")
+    println(q)
+
+    // 6. Generics Resolution + Loop Factorial
+    let gen_val = identity<Int>(99)
+    let fact5 = factorial(5)
+    print("6. Generic + 5!     : ")
+    println(gen_val + fact5)
+
+    // 7. M:N Async Scheduler (Fibers / Tasks)
+    let t1 = spawn worker(5)
+    let t2 = spawn worker(6)
+    let r1 = await t1
+    let r2 = await t2
+    print("7. M:N Async Fibers : ")
+    println(r1 + r2)
+
+    // 8. Lowering Optimizations (Constant Folding + DCE)
+    let folded = (2 + 3) * 10 - 8
+    let unused_dead_var = 999999
+    print("8. Constant Folded  : ")
+    println(folded)
+
+    // 9. Scope exit ARC deterministic free + Tracing GC Mark-and-Sweep reclaim
+    let scoped_sum = scope_demo()
+    print("9. Scope ARC+GC sum : ")
+    println(scoped_sum)
+    gc_collect()
+    mem_stats()
+    return 0
+}

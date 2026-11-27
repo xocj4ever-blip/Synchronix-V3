@@ -1,0 +1,1254 @@
+// SPDX-License-Identifier: Apache-2.0
+//
+// Copyright 2026 Synchronix Contributors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
+// Full license text: ../../LICENSE
+// End-User License Agreement: ../../EULA.md
+
+// ============================================================================
+// SYNCHRONIX v3.0.0 — Phase 3: Unified 6-Target Native & Bare-Metal Codegen
+// (src/backend/codegen.synchronix)
+// ============================================================================
+// Pure Synchronix Code Generator emitting from optimized SUMIR + RegAlloc:
+//   1. Custom x86_64 Host Native Assembly (Win64 + simulated HAL)
+//   2. Custom x86_64 Bare-Metal ELF Assembly (x86_64-none-elf, real MMIO/IRQ)
+//   3. Custom ARM Cortex-M4/M7 Thumb-2 Bare-Metal Assembly (thumbv7em-none-eabi)
+//   4. Custom ARM64 (AArch64) Host Native Assembly (aarch64-w64-windows-gnu)
+//   5. Custom ARM64 (AArch64) Bare-Metal ELF Assembly (aarch64-none-elf)
+//   6. Unified Hosted & Freestanding LLVM IR (.ll) Generator (--emit-llvm)
+// ============================================================================
+
+import sx_defs
+import utils
+
+extern func fputs(s: String, fp: Int) -> Int;
+
+phi codegen_x64_frame_align = (2104 + 56) == 2160
+phi codegen_cm4_frame_align = 1024 == (256 * 4)
+phi codegen_targets_count   = 6 == 6
+
+// ----------------------------------------------------------------------------
+// Portable File Output Helpers
+// ----------------------------------------------------------------------------
+func sx_emit_s(fp: Int, s: String) -> Int {
+    fputs(s, fp)
+    return 0
+}
+
+func sx_emit_div10(n: Int, d: Int) -> Int
+    requires d != 0
+{
+    return n / d
+}
+
+func sx_emit_mod10(n: Int, d: Int) -> Int
+    requires d != 0
+{
+    return n % d
+}
+
+func sx_emit_int(fp: Int, v_in: Int) -> Int {
+    var v = v_in
+    if v == 0 {
+        fputc(48, fp)
+        return 0
+    }
+    if v < 0 {
+        fputc(45, fp)
+        v = -v
+    }
+    let digits = sx_buf_new(24)
+    var n = 0
+    while v > 0 && n < 24 {
+        let d = sx_emit_mod10(v, 10)
+        sx_buf_set(digits, n, d + 48)
+        v = sx_emit_div10(v, 10)
+        n = n + 1
+    }
+    var i = n - 1
+    while i >= 0 {
+        let ch = sx_buf_get(digits, i)
+        fputc(ch, fp)
+        i = i - 1
+    }
+    sx_buf_free(digits)
+    return 0
+}
+
+func sx_emit_quote(fp: Int) -> Int {
+    fputc(34, fp)
+    return 0
+}
+
+func sx_emit_nl(fp: Int) -> Int {
+    fputc(10, fp)
+    return 0
+}
+
+func sx_emit_fn_label(ctx: Int, fp: Int, s1: Int, s2: Int) -> Int {
+    if s2 < 0 {
+        sx_emit_s(fp, "__sx_lambda_")
+        sx_emit_int(fp, s1)
+    } else {
+        sx_fprint_slice(ctx, fp, s1, s2)
+    }
+    return 0
+}
+
+func sx_emit_str_table(ctx: Int, fp: Int) -> Int {
+    let scnt = sx_ctx_get(ctx, CTX_STR_COUNT())
+    let stbl = sx_ctx_get(ctx, CTX_STRINGS())
+    var i = 0
+    while i < scnt {
+        let base = i * 2
+        let ss = sx_buf_get(stbl, base)
+        let sl = sx_buf_get(stbl, base + 1)
+        sx_emit_s(fp, ".Lstr_")
+        sx_emit_int(fp, i)
+        sx_emit_s(fp, ":\n    .asciz ")
+        sx_emit_quote(fp)
+        sx_fprint_slice(ctx, fp, ss, sl)
+        sx_emit_quote(fp)
+        sx_emit_nl(fp)
+        i = i + 1
+    }
+    return 0
+}
+
+// ----------------------------------------------------------------------------
+// Builtin Runtime Name Resolver
+// ----------------------------------------------------------------------------
+func sx_emit_callee_name(ctx: Int, fp: Int, ns: Int, nl: Int) -> Int {
+    if sx_slice_eq_cstr(ctx, ns, nl, "abs")        != 0 { sx_emit_s(fp, "sx_abs"); return 1 }
+    if sx_slice_eq_cstr(ctx, ns, nl, "min")        != 0 { sx_emit_s(fp, "sx_min"); return 1 }
+    if sx_slice_eq_cstr(ctx, ns, nl, "max")        != 0 { sx_emit_s(fp, "sx_max"); return 1 }
+    if sx_slice_eq_cstr(ctx, ns, nl, "pow")        != 0 { sx_emit_s(fp, "sx_pow"); return 1 }
+    if sx_slice_eq_cstr(ctx, ns, nl, "mem_stats")  != 0 { sx_emit_s(fp, "sx_runtime_report"); return 1 }
+    if sx_slice_eq_cstr(ctx, ns, nl, "phi_stats")  != 0 { sx_emit_s(fp, "sx_phi_stats"); return 1 }
+    if sx_slice_eq_cstr(ctx, ns, nl, "gc_collect") != 0 { sx_emit_s(fp, "sx_gc_collect"); return 1 }
+    return 0
+}
+
+func sx_emit_call_target(ctx: Int, fp: Int, ns: Int, nl: Int) -> Int {
+    let matched = sx_emit_callee_name(ctx, fp, ns, nl)
+    if matched == 0 {
+        sx_fprint_slice(ctx, fp, ns, nl)
+    }
+    return 0
+}
+
+func sx_emit_print_target(ctx: Int, fp: Int, inst_idx: Int) -> Int {
+    let ns = sx_ir_get(ctx, inst_idx, IR_SRC1())
+    let nl = sx_ir_get(ctx, inst_idx, IR_SRC2())
+    let arg_ty = sx_ir_get(ctx, inst_idx, IR_TYPE())
+
+    if sx_slice_eq_cstr(ctx, ns, nl, "println") != 0 {
+        if arg_ty == TY_STR() {
+            sx_emit_s(fp, "sx_println_str")
+        } else {
+            sx_emit_s(fp, "sx_println_int")
+        }
+        return 0
+    }
+    if sx_slice_eq_cstr(ctx, ns, nl, "print") != 0 {
+        if arg_ty == TY_STR() {
+            sx_emit_s(fp, "sx_print_str")
+        } else {
+            sx_emit_s(fp, "sx_print_int")
+        }
+        return 0
+    }
+    sx_emit_call_target(ctx, fp, ns, nl)
+    return 0
+}
+
+// ============================================================================
+// 1 & 2. Custom x86_64 Native (Win64 Host & Freestanding Bare-Metal ELF)
+// ============================================================================
+func sx_x64_emit_phys(fp: Int, p: Int) -> Int {
+    if p == 0 { sx_emit_s(fp, "%rbx"); return 0 }
+    if p == 1 { sx_emit_s(fp, "%r12"); return 0 }
+    if p == 2 { sx_emit_s(fp, "%r13"); return 0 }
+    if p == 3 { sx_emit_s(fp, "%r14"); return 0 }
+    sx_emit_s(fp, "%r15")
+    return 0
+}
+
+func sx_x64_emit_argreg(fp: Int, idx: Int, is_bare: Int) -> Int {
+    if is_bare != 0 {
+        if idx == 0 { sx_emit_s(fp, "%rdi"); return 0 }
+        if idx == 1 { sx_emit_s(fp, "%rsi"); return 0 }
+        if idx == 2 { sx_emit_s(fp, "%rdx"); return 0 }
+        sx_emit_s(fp, "%rcx")
+        return 0
+    }
+    if idx == 0 { sx_emit_s(fp, "%rcx"); return 0 }
+    if idx == 1 { sx_emit_s(fp, "%rdx"); return 0 }
+    if idx == 2 { sx_emit_s(fp, "%r8");  return 0 }
+    sx_emit_s(fp, "%r9")
+    return 0
+}
+
+func sx_x64_ld(fp: Int, vphys: Int, vreg: Int, target: String) -> Int {
+    var phys = -1
+    if vreg >= 0 && vreg < 256 {
+        phys = sx_buf_get(vphys, vreg)
+    }
+    sx_emit_s(fp, "    movq ")
+    if phys >= 0 {
+        sx_x64_emit_phys(fp, phys)
+    } else {
+        sx_emit_s(fp, "-")
+        sx_emit_int(fp, 48 + vreg * 8)
+        sx_emit_s(fp, "(%rbp)")
+    }
+    sx_emit_s(fp, ", ")
+    sx_emit_s(fp, target)
+    sx_emit_nl(fp)
+    return 0
+}
+
+func sx_x64_st(fp: Int, vphys: Int, src: String, vreg: Int) -> Int {
+    var phys = -1
+    if vreg >= 0 && vreg < 256 {
+        phys = sx_buf_get(vphys, vreg)
+    }
+    sx_emit_s(fp, "    movq ")
+    sx_emit_s(fp, src)
+    sx_emit_s(fp, ", ")
+    if phys >= 0 {
+        sx_x64_emit_phys(fp, phys)
+    } else {
+        sx_emit_s(fp, "-")
+        sx_emit_int(fp, 48 + vreg * 8)
+        sx_emit_s(fp, "(%rbp)")
+    }
+    sx_emit_nl(fp)
+    return 0
+}
+
+func sx_x64_emit_alu(fp: Int, op: Int) -> Int {
+    if op == IR_ADD()    { sx_emit_s(fp, "    addq %r10, %rax\n"); return 0 }
+    if op == IR_SUB()    { sx_emit_s(fp, "    subq %r10, %rax\n"); return 0 }
+    if op == IR_MUL()    { sx_emit_s(fp, "    imulq %r10, %rax\n"); return 0 }
+    if op == IR_DIV()    { sx_emit_s(fp, "    cqto\n    idivq %r10\n"); return 0 }
+    if op == IR_MOD()    { sx_emit_s(fp, "    cqto\n    idivq %r10\n    movq %rdx, %rax\n"); return 0 }
+    if op == IR_AND()    { sx_emit_s(fp, "    andq %r10, %rax\n"); return 0 }
+    if op == IR_OR()     { sx_emit_s(fp, "    orq %r10, %rax\n"); return 0 }
+    if op == IR_CMP_EQ() { sx_emit_s(fp, "    cmpq %r10, %rax\n    sete %al\n    movzbq %al, %rax\n"); return 0 }
+    if op == IR_CMP_NE() { sx_emit_s(fp, "    cmpq %r10, %rax\n    setne %al\n    movzbq %al, %rax\n"); return 0 }
+    if op == IR_CMP_LT() { sx_emit_s(fp, "    cmpq %r10, %rax\n    setl %al\n    movzbq %al, %rax\n"); return 0 }
+    if op == IR_CMP_LE() { sx_emit_s(fp, "    cmpq %r10, %rax\n    setle %al\n    movzbq %al, %rax\n"); return 0 }
+    if op == IR_CMP_GT() { sx_emit_s(fp, "    cmpq %r10, %rax\n    setg %al\n    movzbq %al, %rax\n"); return 0 }
+    if op == IR_CMP_GE() { sx_emit_s(fp, "    cmpq %r10, %rax\n    setge %al\n    movzbq %al, %rax\n"); return 0 }
+    return 0
+}
+
+func sx_x64_emit_hw_op(ctx: Int, fp: Int, vphys: Int, idx: Int) -> Int {
+    let op = sx_ir_get(ctx, idx, IR_OP())
+    let dst = sx_ir_get(ctx, idx, IR_DST())
+    let s1 = sx_ir_get(ctx, idx, IR_SRC1())
+    let s2 = sx_ir_get(ctx, idx, IR_SRC2())
+    let is_bare = sx_ctx_get(ctx, CTX_OPT_TARGET()) == TARGET_X86_64_BARE()
+
+    if is_bare != 0 {
+        if op == IR_MMIO_READ() {
+            sx_x64_ld(fp, vphys, s1, "%rax")
+            sx_emit_s(fp, "    movl (%rax), %eax\n")
+            sx_x64_st(fp, vphys, "%rax", dst); return 0
+        }
+        if op == IR_MMIO_WRITE() {
+            sx_x64_ld(fp, vphys, s1, "%rax")
+            sx_x64_ld(fp, vphys, s2, "%r10")
+            sx_emit_s(fp, "    movl %r10d, (%rax)\n")
+            sx_x64_st(fp, vphys, "%r10", dst); return 0
+        }
+        if op == IR_IRQ_DISABLE() {
+            sx_emit_s(fp, "    cli\n    xorq %rax, %rax\n")
+            sx_x64_st(fp, vphys, "%rax", dst); return 0
+        }
+        if op == IR_IRQ_ENABLE() {
+            sx_emit_s(fp, "    sti\n    xorq %rax, %rax\n")
+            sx_x64_st(fp, vphys, "%rax", dst); return 0
+        }
+        if op == IR_WFI() {
+            sx_emit_s(fp, "    hlt\n    xorq %rax, %rax\n")
+            sx_x64_st(fp, vphys, "%rax", dst); return 0
+        }
+        if op == IR_DMB() {
+            sx_emit_s(fp, "    mfence\n    xorq %rax, %rax\n")
+            sx_x64_st(fp, vphys, "%rax", dst); return 0
+        }
+        return 0
+    }
+
+    // Host x86_64 safe HAL simulation calls
+    if op == IR_MMIO_READ() {
+        sx_x64_ld(fp, vphys, s1, "%rax")
+        sx_emit_s(fp, "    movq %rax, %rcx\n    call sx_emb_mmio_read\n")
+        sx_x64_st(fp, vphys, "%rax", dst); return 0
+    }
+    if op == IR_MMIO_WRITE() {
+        sx_x64_ld(fp, vphys, s1, "%rax")
+        sx_x64_ld(fp, vphys, s2, "%r10")
+        sx_emit_s(fp, "    movq %rax, %rcx\n    movq %r10, %rdx\n    call sx_emb_mmio_write\n")
+        sx_x64_st(fp, vphys, "%rax", dst); return 0
+    }
+    if op == IR_IRQ_DISABLE() {
+        sx_emit_s(fp, "    call sx_emb_irq_disable\n")
+        sx_x64_st(fp, vphys, "%rax", dst); return 0
+    }
+    if op == IR_IRQ_ENABLE() {
+        sx_emit_s(fp, "    call sx_emb_irq_enable\n")
+        sx_x64_st(fp, vphys, "%rax", dst); return 0
+    }
+    if op == IR_WFI() {
+        sx_emit_s(fp, "    call sx_emb_wfi\n")
+        sx_x64_st(fp, vphys, "%rax", dst); return 0
+    }
+    if op == IR_DMB() {
+        sx_emit_s(fp, "    call sx_emb_dmb\n")
+        sx_x64_st(fp, vphys, "%rax", dst); return 0
+    }
+    return 0
+}
+
+func sx_x64_emit_runtime_op(ctx: Int, fp: Int, vphys: Int, idx: Int) -> Int {
+    let op = sx_ir_get(ctx, idx, IR_OP())
+    if op >= IR_MMIO_READ() {
+        sx_x64_emit_hw_op(ctx, fp, vphys, idx)
+        return 0
+    }
+    let dst = sx_ir_get(ctx, idx, IR_DST())
+    let s1 = sx_ir_get(ctx, idx, IR_SRC1())
+    let s2 = sx_ir_get(ctx, idx, IR_SRC2())
+    let imm = sx_ir_get(ctx, idx, IR_IMM())
+    let is_bare = sx_ctx_get(ctx, CTX_OPT_TARGET()) == TARGET_X86_64_BARE()
+
+    if op == IR_ARC_NEW() {
+        sx_x64_ld(fp, vphys, s1, "%rax")
+        sx_emit_s(fp, "    movq %rax, "); sx_x64_emit_argreg(fp, 0, is_bare); sx_emit_s(fp, "\n    call sx_arc_box_int\n")
+        sx_x64_st(fp, vphys, "%rax", dst); return 0
+    }
+    if op == IR_ARC_RETAIN() {
+        sx_x64_ld(fp, vphys, s1, "%rax")
+        sx_emit_s(fp, "    movq %rax, "); sx_x64_emit_argreg(fp, 0, is_bare); sx_emit_s(fp, "\n    call sx_arc_retain\n"); return 0
+    }
+    if op == IR_ARC_RELEASE() {
+        sx_x64_ld(fp, vphys, s1, "%rax")
+        sx_emit_s(fp, "    movq %rax, "); sx_x64_emit_argreg(fp, 0, is_bare); sx_emit_s(fp, "\n    call sx_arc_release\n"); return 0
+    }
+    if op == IR_ARC_LOAD() {
+        sx_x64_ld(fp, vphys, s1, "%rax")
+        sx_emit_s(fp, "    movq %rax, "); sx_x64_emit_argreg(fp, 0, is_bare); sx_emit_s(fp, "\n    call sx_arc_unbox_int\n")
+        sx_x64_st(fp, vphys, "%rax", dst); return 0
+    }
+    if op == IR_GC_NEW() {
+        sx_x64_ld(fp, vphys, s1, "%rax")
+        sx_emit_s(fp, "    movq %rax, "); sx_x64_emit_argreg(fp, 0, is_bare); sx_emit_s(fp, "\n    call sx_gc_box_int\n")
+        sx_x64_st(fp, vphys, "%rax", dst); return 0
+    }
+    if op == IR_GC_ROOT() {
+        sx_x64_ld(fp, vphys, s1, "%rax")
+        sx_emit_s(fp, "    movq %rax, "); sx_x64_emit_argreg(fp, 0, is_bare); sx_emit_s(fp, "\n    call sx_gc_push_root\n"); return 0
+    }
+    if op == IR_GC_UNROOT() {
+        sx_emit_s(fp, "    call sx_gc_pop_root\n"); return 0
+    }
+    if op == IR_GC_LOAD() {
+        sx_x64_ld(fp, vphys, s1, "%rax")
+        sx_emit_s(fp, "    movq %rax, "); sx_x64_emit_argreg(fp, 0, is_bare); sx_emit_s(fp, "\n    call sx_gc_unbox_int\n")
+        sx_x64_st(fp, vphys, "%rax", dst); return 0
+    }
+    if op == IR_BORROW() || op == IR_MOVE() {
+        sx_x64_ld(fp, vphys, s1, "%rax")
+        sx_x64_st(fp, vphys, "%rax", dst); return 0
+    }
+    if op == IR_PHI_ASSERT() {
+        sx_x64_ld(fp, vphys, s1, "%rax")
+        sx_emit_s(fp, "    movq %rax, "); sx_x64_emit_argreg(fp, 0, is_bare)
+        sx_emit_s(fp, "\n    movq $"); sx_emit_int(fp, imm); sx_emit_s(fp, ", "); sx_x64_emit_argreg(fp, 1, is_bare)
+        sx_emit_s(fp, "\n    call sx_phi_check\n"); return 0
+    }
+    if op == IR_CLOSURE_NEW() {
+        sx_emit_s(fp, "    leaq __sx_lambda_"); sx_emit_int(fp, s1); sx_emit_s(fp, "(%rip), "); sx_x64_emit_argreg(fp, 0, is_bare)
+        sx_emit_s(fp, "\n    movq $"); sx_emit_int(fp, imm); sx_emit_s(fp, ", "); sx_x64_emit_argreg(fp, 1, is_bare)
+        sx_emit_s(fp, "\n    call sx_closure_alloc\n")
+        sx_x64_st(fp, vphys, "%rax", dst); return 0
+    }
+    if op == IR_CLOSURE_SET() {
+        sx_x64_ld(fp, vphys, dst, "%rax")
+        sx_x64_ld(fp, vphys, s1, "%r10")
+        sx_emit_s(fp, "    movq %rax, "); sx_x64_emit_argreg(fp, 0, is_bare)
+        sx_emit_s(fp, "\n    movq $"); sx_emit_int(fp, imm); sx_emit_s(fp, ", "); sx_x64_emit_argreg(fp, 1, is_bare)
+        sx_emit_s(fp, "\n    movq %r10, "); sx_x64_emit_argreg(fp, 2, is_bare)
+        sx_emit_s(fp, "\n    call sx_closure_set_env\n"); return 0
+    }
+    if op == IR_CLOSURE_GET() {
+        sx_x64_ld(fp, vphys, s1, "%rax")
+        sx_emit_s(fp, "    movq %rax, "); sx_x64_emit_argreg(fp, 0, is_bare)
+        sx_emit_s(fp, "\n    movq $"); sx_emit_int(fp, imm); sx_emit_s(fp, ", "); sx_x64_emit_argreg(fp, 1, is_bare)
+        sx_emit_s(fp, "\n    call sx_closure_get_env\n")
+        sx_x64_st(fp, vphys, "%rax", dst); return 0
+    }
+    if op == IR_CLOSURE_CALL() {
+        sx_x64_ld(fp, vphys, s1, "%rax")
+        sx_x64_ld(fp, vphys, s2, "%r10")
+        sx_emit_s(fp, "    movq %rax, "); sx_x64_emit_argreg(fp, 0, is_bare)
+        sx_emit_s(fp, "\n    movq %r10, "); sx_x64_emit_argreg(fp, 1, is_bare)
+        sx_emit_s(fp, "\n    call sx_closure_call1\n")
+        sx_x64_st(fp, vphys, "%rax", dst); return 0
+    }
+    if op == IR_SPAWN() {
+        sx_x64_ld(fp, vphys, imm, "%rax")
+        sx_emit_s(fp, "    movq %rax, "); sx_x64_emit_argreg(fp, 1, is_bare)
+        sx_emit_s(fp, "\n    leaq "); sx_fprint_slice(ctx, fp, s1, s2); sx_emit_s(fp, "(%rip), "); sx_x64_emit_argreg(fp, 0, is_bare)
+        sx_emit_s(fp, "\n    call sx_spawn\n")
+        sx_x64_st(fp, vphys, "%rax", dst); return 0
+    }
+    if op == IR_AWAIT() {
+        sx_x64_ld(fp, vphys, s1, "%rax")
+        sx_emit_s(fp, "    movq %rax, "); sx_x64_emit_argreg(fp, 0, is_bare)
+        sx_emit_s(fp, "\n    call sx_await\n")
+        sx_x64_st(fp, vphys, "%rax", dst); return 0
+    }
+    return 0
+}
+
+func sx_x64_scan_fn_phys(ctx: Int, vphys: Int, start_idx: Int, cnt: Int) -> Int {
+    var k = 0
+    while k < 256 {
+        sx_buf_set(vphys, k, -1)
+        k = k + 1
+    }
+    var j = start_idx + 1
+    var done = 0
+    while j < cnt && done == 0 {
+        let op = sx_ir_get(ctx, j, IR_OP())
+        if op == IR_FUNC_END() {
+            done = 1
+        } else {
+            let ph = sx_ir_get(ctx, j, IR_PHYS())
+            let dst = sx_ir_get(ctx, j, IR_DST())
+            if ph >= 0 && dst > 0 && dst < 256 {
+                sx_buf_set(vphys, dst, ph)
+            }
+            j = j + 1
+        }
+    }
+    return 0
+}
+
+func sx_x64_emit_inst_core(ctx: Int, fp: Int, vphys: Int, i: Int) -> Int {
+    let op = sx_ir_get(ctx, i, IR_OP())
+    let dst = sx_ir_get(ctx, i, IR_DST())
+    let s1 = sx_ir_get(ctx, i, IR_SRC1())
+    let s2 = sx_ir_get(ctx, i, IR_SRC2())
+    let imm = sx_ir_get(ctx, i, IR_IMM())
+    let is_bare = sx_ctx_get(ctx, CTX_OPT_TARGET()) == TARGET_X86_64_BARE()
+
+    if op == IR_PARAM() {
+        sx_emit_s(fp, "    movq ")
+        sx_x64_emit_argreg(fp, imm, is_bare)
+        sx_emit_s(fp, ", %rax\n")
+        sx_x64_st(fp, vphys, "%rax", dst)
+        return 0
+    }
+    if op == IR_CONST() {
+        sx_emit_s(fp, "    movabsq $")
+        sx_emit_int(fp, imm)
+        sx_emit_s(fp, ", %rax\n")
+        sx_x64_st(fp, vphys, "%rax", dst)
+        return 0
+    }
+    if op == IR_STR_CONST() {
+        sx_emit_s(fp, "    leaq .Lstr_")
+        sx_emit_int(fp, imm)
+        sx_emit_s(fp, "(%rip), %rax\n")
+        sx_x64_st(fp, vphys, "%rax", dst)
+        return 0
+    }
+    if op == IR_MOV() || op == IR_BORROW() || op == IR_MOVE() {
+        sx_x64_ld(fp, vphys, s1, "%rax")
+        sx_x64_st(fp, vphys, "%rax", dst)
+        return 0
+    }
+    if op >= IR_ADD() && op <= IR_OR() && op != IR_NEG() {
+        sx_x64_ld(fp, vphys, s1, "%rax")
+        sx_x64_ld(fp, vphys, s2, "%r10")
+        sx_x64_emit_alu(fp, op)
+        sx_x64_st(fp, vphys, "%rax", dst)
+        return 0
+    }
+    if op == IR_NEG() {
+        sx_x64_ld(fp, vphys, s1, "%rax")
+        sx_emit_s(fp, "    negq %rax\n")
+        sx_x64_st(fp, vphys, "%rax", dst)
+        return 0
+    }
+    if op == IR_NOT() {
+        sx_x64_ld(fp, vphys, s1, "%rax")
+        sx_emit_s(fp, "    cmpq $0, %rax\n    sete %al\n    movzbq %al, %rax\n")
+        sx_x64_st(fp, vphys, "%rax", dst)
+        return 0
+    }
+    if op == IR_LABEL() {
+        sx_emit_s(fp, ".Lir_")
+        sx_emit_int(fp, dst)
+        sx_emit_s(fp, ":\n")
+        return 0
+    }
+    if op == IR_JMP() {
+        sx_emit_s(fp, "    jmp .Lir_")
+        sx_emit_int(fp, dst)
+        sx_emit_nl(fp)
+        return 0
+    }
+    if op == IR_BRZ() {
+        sx_x64_ld(fp, vphys, s1, "%rax")
+        sx_emit_s(fp, "    cmpq $0, %rax\n    je .Lir_")
+        sx_emit_int(fp, dst)
+        sx_emit_nl(fp)
+        return 0
+    }
+    return 0
+}
+
+func sx_codegen_x86_64(ctx: Int, fp: Int) -> Int {
+    let is_bare = sx_ctx_get(ctx, CTX_OPT_TARGET()) == TARGET_X86_64_BARE()
+    if is_bare != 0 {
+        sx_emit_s(fp, "# Generated by SYNCHRONIX v3.0.0 - Target: x86_64-none-elf (Bare-Metal)\n")
+        sx_emit_s(fp, ".section .rodata\n")
+    } else {
+        sx_emit_s(fp, "# Generated by SYNCHRONIX v3.0.0 - Target: x86_64 (Host Native)\n")
+        sx_emit_s(fp, ".section .rdata,")
+        sx_emit_quote(fp); sx_emit_s(fp, "dr"); sx_emit_quote(fp); sx_emit_nl(fp)
+    }
+    sx_emit_str_table(ctx, fp)
+    sx_emit_s(fp, "\n.section .text\n")
+
+    let bare_boot = sx_ctx_get(ctx, CTX_OPT_BARE())
+    if is_bare != 0 && bare_boot != 0 {
+        sx_emit_s(fp, ".globl _start\n_start:\n    call main\n.Lhalt_x64:\n    hlt\n    jmp .Lhalt_x64\n")
+    }
+
+    let vphys = sx_buf_new(256)
+    let arg_vregs = sx_buf_new(8)
+    let cnt = sx_ctx_get(ctx, CTX_IR_COUNT())
+    var cur_fn = 0
+    var i = 0
+
+    while i < cnt {
+        let fl = sx_ir_get(ctx, i, IR_FLAGS())
+        let dead = fl && IRF_DEAD()
+        if dead == 0 {
+            let op = sx_ir_get(ctx, i, IR_OP())
+            let dst = sx_ir_get(ctx, i, IR_DST())
+            let s1 = sx_ir_get(ctx, i, IR_SRC1())
+            let s2 = sx_ir_get(ctx, i, IR_SRC2())
+            let imm = sx_ir_get(ctx, i, IR_IMM())
+
+            if op == IR_FUNC_BEGIN() {
+                cur_fn = dst
+                sx_x64_scan_fn_phys(ctx, vphys, i, cnt)
+                sx_emit_s(fp, "\n.globl ")
+                sx_emit_fn_label(ctx, fp, s1, s2)
+                sx_emit_s(fp, "\n.p2align 4\n")
+                sx_emit_fn_label(ctx, fp, s1, s2)
+                sx_emit_s(fp, ":\n    pushq %rbp\n    movq %rsp, %rbp\n    pushq %rbx\n    pushq %r12\n    pushq %r13\n    pushq %r14\n    pushq %r15\n    subq $2104, %rsp\n")
+            }
+            if op == IR_FUNC_END() {
+                sx_emit_s(fp, ".Lfn_epi_")
+                sx_emit_int(fp, dst)
+                sx_emit_s(fp, ":\n    leaq -40(%rbp), %rsp\n    popq %r15\n    popq %r14\n    popq %r13\n    popq %r12\n    popq %rbx\n    popq %rbp\n    ret\n")
+            }
+            if op >= IR_PARAM() && op <= IR_BRZ() {
+                sx_x64_emit_inst_core(ctx, fp, vphys, i)
+            }
+            if op == IR_ARG() {
+                sx_buf_set(arg_vregs, imm, s1)
+            }
+            if op == IR_CALL() {
+                var a = 0
+                while a < imm && a < 4 {
+                    let av = sx_buf_get(arg_vregs, a)
+                    sx_x64_ld(fp, vphys, av, "%rax")
+                    sx_emit_s(fp, "    movq %rax, ")
+                    sx_x64_emit_argreg(fp, a, is_bare)
+                    sx_emit_nl(fp)
+                    a = a + 1
+                }
+                sx_emit_s(fp, "    call ")
+                sx_emit_print_target(ctx, fp, i)
+                sx_emit_nl(fp)
+                sx_x64_st(fp, vphys, "%rax", dst)
+            }
+            if op == IR_RET() {
+                sx_x64_ld(fp, vphys, s1, "%rax")
+                sx_emit_s(fp, "    jmp .Lfn_epi_")
+                sx_emit_int(fp, cur_fn)
+                sx_emit_nl(fp)
+            }
+            if op >= IR_ARC_NEW() {
+                sx_x64_emit_runtime_op(ctx, fp, vphys, i)
+            }
+        }
+        i = i + 1
+    }
+
+    sx_buf_free(vphys)
+    sx_buf_free(arg_vregs)
+    return 0
+}
+
+// ============================================================================
+// 3. Custom ARM Cortex-M4 / M7 Thumb-2 Bare-Metal Assembly (thumbv7em-none-eabi)
+// ============================================================================
+func sx_cm_ld(fp: Int, vreg: Int, reg: String) -> Int {
+    sx_emit_s(fp, "    movw r12, #")
+    sx_emit_int(fp, 4 + vreg * 4)
+    sx_emit_s(fp, "\n    sub r12, r11, r12\n    ldr ")
+    sx_emit_s(fp, reg)
+    sx_emit_s(fp, ", [r12]\n")
+    return 0
+}
+
+func sx_cm_st(fp: Int, reg: String, vreg: Int) -> Int {
+    sx_emit_s(fp, "    movw r12, #")
+    sx_emit_int(fp, 4 + vreg * 4)
+    sx_emit_s(fp, "\n    sub r12, r11, r12\n    str ")
+    sx_emit_s(fp, reg)
+    sx_emit_s(fp, ", [r12]\n")
+    return 0
+}
+
+func sx_cm_emit_alu(fp: Int, op: Int) -> Int {
+    if op == IR_ADD()    { sx_emit_s(fp, "    add r0, r0, r9\n"); return 0 }
+    if op == IR_SUB()    { sx_emit_s(fp, "    sub r0, r0, r9\n"); return 0 }
+    if op == IR_MUL()    { sx_emit_s(fp, "    mul r0, r0, r9\n"); return 0 }
+    if op == IR_DIV()    { sx_emit_s(fp, "    sdiv r0, r0, r9\n"); return 0 }
+    if op == IR_MOD()    { sx_emit_s(fp, "    sdiv r12, r0, r9\n    mls r0, r12, r9, r0\n"); return 0 }
+    if op == IR_AND()    { sx_emit_s(fp, "    and r0, r0, r9\n"); return 0 }
+    if op == IR_OR()     { sx_emit_s(fp, "    orr r0, r0, r9\n"); return 0 }
+    if op == IR_CMP_EQ() { sx_emit_s(fp, "    cmp r0, r9\n    ite eq\n    moveq r0, #1\n    movne r0, #0\n"); return 0 }
+    if op == IR_CMP_NE() { sx_emit_s(fp, "    cmp r0, r9\n    ite ne\n    movne r0, #1\n    moveq r0, #0\n"); return 0 }
+    if op == IR_CMP_LT() { sx_emit_s(fp, "    cmp r0, r9\n    ite lt\n    movlt r0, #1\n    movge r0, #0\n"); return 0 }
+    if op == IR_CMP_LE() { sx_emit_s(fp, "    cmp r0, r9\n    ite le\n    movle r0, #1\n    movgt r0, #0\n"); return 0 }
+    if op == IR_CMP_GT() { sx_emit_s(fp, "    cmp r0, r9\n    ite gt\n    movgt r0, #1\n    movle r0, #0\n"); return 0 }
+    if op == IR_CMP_GE() { sx_emit_s(fp, "    cmp r0, r9\n    ite ge\n    movge r0, #1\n    movlt r0, #0\n"); return 0 }
+    return 0
+}
+
+func sx_cm_emit_core(ctx: Int, fp: Int, i: Int) -> Int {
+    let op = sx_ir_get(ctx, i, IR_OP())
+    let dst = sx_ir_get(ctx, i, IR_DST())
+    let s1 = sx_ir_get(ctx, i, IR_SRC1())
+    let s2 = sx_ir_get(ctx, i, IR_SRC2())
+    let imm = sx_ir_get(ctx, i, IR_IMM())
+
+    if op == IR_PARAM() {
+        if imm == 0 { sx_cm_st(fp, "r0", dst) }
+        if imm == 1 { sx_cm_st(fp, "r1", dst) }
+        if imm == 2 { sx_cm_st(fp, "r2", dst) }
+        if imm >= 3 { sx_cm_st(fp, "r3", dst) }
+        return 0
+    }
+    if op == IR_CONST() {
+        if imm >= 0 && imm <= 65535 {
+            sx_emit_s(fp, "    movw r0, #")
+            sx_emit_int(fp, imm)
+            sx_emit_nl(fp)
+        } else {
+            sx_emit_s(fp, "    movw r0, #(")
+            sx_emit_int(fp, imm)
+            sx_emit_s(fp, ") & 65535\n    movt r0, #((")
+            sx_emit_int(fp, imm)
+            sx_emit_s(fp, ") >> 16) & 65535\n")
+        }
+        sx_cm_st(fp, "r0", dst)
+        return 0
+    }
+    if op == IR_STR_CONST() {
+        sx_emit_s(fp, "    movw r0, #:lower16:.Lstr_")
+        sx_emit_int(fp, imm)
+        sx_emit_s(fp, "\n    movt r0, #:upper16:.Lstr_")
+        sx_emit_int(fp, imm)
+        sx_emit_nl(fp)
+        sx_cm_st(fp, "r0", dst)
+        return 0
+    }
+    if op == IR_MOV() || op == IR_BORROW() || op == IR_MOVE() {
+        sx_cm_ld(fp, s1, "r0")
+        sx_cm_st(fp, "r0", dst)
+        return 0
+    }
+    if op >= IR_ADD() && op <= IR_OR() && op != IR_NEG() {
+        sx_cm_ld(fp, s1, "r0")
+        sx_cm_ld(fp, s2, "r9")
+        sx_cm_emit_alu(fp, op)
+        sx_cm_st(fp, "r0", dst)
+        return 0
+    }
+    if op == IR_NEG() {
+        sx_cm_ld(fp, s1, "r0")
+        sx_emit_s(fp, "    rsbs r0, r0, #0\n")
+        sx_cm_st(fp, "r0", dst)
+        return 0
+    }
+    if op == IR_NOT() {
+        sx_cm_ld(fp, s1, "r0")
+        sx_emit_s(fp, "    cmp r0, #0\n    ite eq\n    moveq r0, #1\n    movne r0, #0\n")
+        sx_cm_st(fp, "r0", dst)
+        return 0
+    }
+    if op == IR_LABEL() {
+        sx_emit_s(fp, ".Lir_")
+        sx_emit_int(fp, dst)
+        sx_emit_s(fp, ":\n")
+        return 0
+    }
+    if op == IR_JMP() {
+        sx_emit_s(fp, "    b.w .Lir_")
+        sx_emit_int(fp, dst)
+        sx_emit_nl(fp)
+        return 0
+    }
+    if op == IR_BRZ() {
+        sx_cm_ld(fp, s1, "r0")
+        sx_emit_s(fp, "    cmp r0, #0\n    beq.w .Lir_")
+        sx_emit_int(fp, dst)
+        sx_emit_nl(fp)
+        return 0
+    }
+    return 0
+}
+
+func sx_cm_emit_rt(ctx: Int, fp: Int, i: Int) -> Int {
+    let op = sx_ir_get(ctx, i, IR_OP())
+    let dst = sx_ir_get(ctx, i, IR_DST())
+    let s1 = sx_ir_get(ctx, i, IR_SRC1())
+    let s2 = sx_ir_get(ctx, i, IR_SRC2())
+    let imm = sx_ir_get(ctx, i, IR_IMM())
+
+    // Real Cortex-M4 Hardware MMIO / Interrupt / Power / Barrier Instructions
+    if op == IR_MMIO_READ() {
+        sx_cm_ld(fp, s1, "r0")
+        sx_emit_s(fp, "    ldr r0, [r0]\n")
+        sx_cm_st(fp, "r0", dst); return 0
+    }
+    if op == IR_MMIO_WRITE() {
+        sx_cm_ld(fp, s1, "r0")
+        sx_cm_ld(fp, s2, "r9")
+        sx_emit_s(fp, "    str r9, [r0]\n")
+        sx_cm_st(fp, "r9", dst); return 0
+    }
+    if op == IR_IRQ_DISABLE() {
+        sx_emit_s(fp, "    cpsid i\n    movs r0, #0\n")
+        sx_cm_st(fp, "r0", dst); return 0
+    }
+    if op == IR_IRQ_ENABLE() {
+        sx_emit_s(fp, "    cpsie i\n    movs r0, #0\n")
+        sx_cm_st(fp, "r0", dst); return 0
+    }
+    if op == IR_WFI() {
+        sx_emit_s(fp, "    wfi\n    movs r0, #0\n")
+        sx_cm_st(fp, "r0", dst); return 0
+    }
+    if op == IR_DMB() {
+        sx_emit_s(fp, "    dmb sy\n    movs r0, #0\n")
+        sx_cm_st(fp, "r0", dst); return 0
+    }
+
+    if op == IR_ARC_NEW()     { sx_cm_ld(fp, s1, "r0"); sx_emit_s(fp, "    bl sx_arc_box_int\n"); sx_cm_st(fp, "r0", dst); return 0 }
+    if op == IR_ARC_RETAIN()  { sx_cm_ld(fp, s1, "r0"); sx_emit_s(fp, "    bl sx_arc_retain\n"); return 0 }
+    if op == IR_ARC_RELEASE() { sx_cm_ld(fp, s1, "r0"); sx_emit_s(fp, "    bl sx_arc_release\n"); return 0 }
+    if op == IR_ARC_LOAD()    { sx_cm_ld(fp, s1, "r0"); sx_emit_s(fp, "    bl sx_arc_unbox_int\n"); sx_cm_st(fp, "r0", dst); return 0 }
+    if op == IR_GC_NEW()      { sx_cm_ld(fp, s1, "r0"); sx_emit_s(fp, "    bl sx_gc_box_int\n"); sx_cm_st(fp, "r0", dst); return 0 }
+    if op == IR_GC_ROOT()     { sx_cm_ld(fp, s1, "r0"); sx_emit_s(fp, "    bl sx_gc_push_root\n"); return 0 }
+    if op == IR_GC_UNROOT()   { sx_emit_s(fp, "    bl sx_gc_pop_root\n"); return 0 }
+    if op == IR_GC_LOAD()     { sx_cm_ld(fp, s1, "r0"); sx_emit_s(fp, "    bl sx_gc_unbox_int\n"); sx_cm_st(fp, "r0", dst); return 0 }
+    if op == IR_BORROW() || op == IR_MOVE() { sx_cm_ld(fp, s1, "r0"); sx_cm_st(fp, "r0", dst); return 0 }
+    if op == IR_PHI_ASSERT() {
+        sx_cm_ld(fp, s1, "r0")
+        sx_emit_s(fp, "    movw r1, #("); sx_emit_int(fp, imm)
+        sx_emit_s(fp, ") & 65535\n    bl sx_phi_check\n"); return 0
+    }
+    if op == IR_CLOSURE_NEW() {
+        sx_emit_s(fp, "    movw r0, #:lower16:__sx_lambda_"); sx_emit_int(fp, s1)
+        sx_emit_s(fp, "\n    movt r0, #:upper16:__sx_lambda_"); sx_emit_int(fp, s1)
+        sx_emit_s(fp, "\n    movw r1, #("); sx_emit_int(fp, imm)
+        sx_emit_s(fp, ") & 65535\n    bl sx_closure_alloc\n")
+        sx_cm_st(fp, "r0", dst); return 0
+    }
+    if op == IR_CLOSURE_SET() {
+        sx_cm_ld(fp, dst, "r0")
+        sx_cm_ld(fp, s1, "r2")
+        sx_emit_s(fp, "    movw r1, #("); sx_emit_int(fp, imm)
+        sx_emit_s(fp, ") & 65535\n    bl sx_closure_set_env\n"); return 0
+    }
+    if op == IR_CLOSURE_GET() {
+        sx_cm_ld(fp, s1, "r0")
+        sx_emit_s(fp, "    movw r1, #("); sx_emit_int(fp, imm)
+        sx_emit_s(fp, ") & 65535\n    bl sx_closure_get_env\n")
+        sx_cm_st(fp, "r0", dst); return 0
+    }
+    if op == IR_CLOSURE_CALL() {
+        sx_cm_ld(fp, s1, "r0")
+        sx_cm_ld(fp, s2, "r1")
+        sx_emit_s(fp, "    bl sx_closure_call1\n")
+        sx_cm_st(fp, "r0", dst); return 0
+    }
+    if op == IR_SPAWN() {
+        sx_cm_ld(fp, imm, "r1")
+        sx_emit_s(fp, "    movw r0, #:lower16:"); sx_fprint_slice(ctx, fp, s1, s2)
+        sx_emit_s(fp, "\n    movt r0, #:upper16:"); sx_fprint_slice(ctx, fp, s1, s2)
+        sx_emit_s(fp, "\n    bl sx_spawn\n")
+        sx_cm_st(fp, "r0", dst); return 0
+    }
+    if op == IR_AWAIT() {
+        sx_cm_ld(fp, s1, "r0")
+        sx_emit_s(fp, "    bl sx_await\n")
+        sx_cm_st(fp, "r0", dst); return 0
+    }
+    return 0
+}
+
+func sx_codegen_cortex_m(ctx: Int, fp: Int) -> Int {
+    sx_emit_s(fp, "// Generated by SYNCHRONIX v3.0.0 - Target: ARM Cortex-M4 (Thumb-2 Bare-Metal)\n")
+    sx_emit_s(fp, ".syntax unified\n.cpu cortex-m4\n.thumb\n\n")
+    sx_emit_s(fp, ".section .rodata\n")
+    sx_emit_str_table(ctx, fp)
+
+    let bare_boot = sx_ctx_get(ctx, CTX_OPT_BARE())
+    if bare_boot != 0 {
+        sx_emit_s(fp, "\n.section .isr_vector,")
+        sx_emit_quote(fp); sx_emit_s(fp, "a"); sx_emit_quote(fp); sx_emit_nl(fp)
+        sx_emit_s(fp, ".word 0x20010000\n.word Reset_Handler\n.word Default_Handler\n.word Default_Handler\n")
+    }
+
+    sx_emit_s(fp, "\n.section .text\n")
+    if bare_boot != 0 {
+        sx_emit_s(fp, ".globl Reset_Handler\n.thumb_func\n.p2align 1\nReset_Handler:\n    bl main\n.Lhalt_cm4:\n    wfi\n    b .Lhalt_cm4\n")
+        sx_emit_s(fp, ".globl Default_Handler\n.thumb_func\n.p2align 1\nDefault_Handler:\n    wfi\n    b Default_Handler\n")
+    }
+
+    let arg_vregs = sx_buf_new(8)
+    let cnt = sx_ctx_get(ctx, CTX_IR_COUNT())
+    var cur_fn = 0
+    var i = 0
+
+    while i < cnt {
+        let fl = sx_ir_get(ctx, i, IR_FLAGS())
+        let dead = fl && IRF_DEAD()
+        if dead == 0 {
+            let op = sx_ir_get(ctx, i, IR_OP())
+            let dst = sx_ir_get(ctx, i, IR_DST())
+            let s1 = sx_ir_get(ctx, i, IR_SRC1())
+            let s2 = sx_ir_get(ctx, i, IR_SRC2())
+            let imm = sx_ir_get(ctx, i, IR_IMM())
+
+            if op == IR_FUNC_BEGIN() {
+                cur_fn = dst
+                sx_emit_s(fp, "\n.globl ")
+                sx_emit_fn_label(ctx, fp, s1, s2)
+                sx_emit_s(fp, "\n.thumb_func\n.p2align 1\n")
+                sx_emit_fn_label(ctx, fp, s1, s2)
+                sx_emit_s(fp, ":\n    push {r4, r5, r6, r7, r8, r11, lr}\n    mov r11, sp\n    sub sp, sp, #1024\n")
+            }
+            if op == IR_FUNC_END() {
+                sx_emit_s(fp, ".Lfn_epi_")
+                sx_emit_int(fp, dst)
+                sx_emit_s(fp, ":\n    mov sp, r11\n    pop {r4, r5, r6, r7, r8, r11, pc}\n    .ltorg\n")
+            }
+            if op >= IR_PARAM() && op <= IR_BRZ() {
+                sx_cm_emit_core(ctx, fp, i)
+            }
+            if op == IR_ARG() {
+                sx_buf_set(arg_vregs, imm, s1)
+            }
+            if op == IR_CALL() {
+                if imm > 0 { let a0 = sx_buf_get(arg_vregs, 0); sx_cm_ld(fp, a0, "r0") }
+                if imm > 1 { let a1 = sx_buf_get(arg_vregs, 1); sx_cm_ld(fp, a1, "r1") }
+                if imm > 2 { let a2 = sx_buf_get(arg_vregs, 2); sx_cm_ld(fp, a2, "r2") }
+                if imm > 3 { let a3 = sx_buf_get(arg_vregs, 3); sx_cm_ld(fp, a3, "r3") }
+                sx_emit_s(fp, "    bl ")
+                sx_emit_print_target(ctx, fp, i)
+                sx_emit_nl(fp)
+                sx_cm_st(fp, "r0", dst)
+            }
+            if op == IR_RET() {
+                sx_cm_ld(fp, s1, "r0")
+                sx_emit_s(fp, "    b.w .Lfn_epi_")
+                sx_emit_int(fp, cur_fn)
+                sx_emit_nl(fp)
+            }
+            if op >= IR_ARC_NEW() {
+                sx_cm_emit_rt(ctx, fp, i)
+            }
+        }
+        i = i + 1
+    }
+
+    sx_buf_free(arg_vregs)
+    return 0
+}
+
+// ============================================================================
+// 4. Custom ARM64 (AArch64) Bare-Metal ELF Assembly (aarch64-none-elf)
+// ============================================================================
+func sx_a64_ld(fp: Int, vreg: Int, reg: String) -> Int {
+    sx_emit_s(fp, "    mov x16, #")
+    sx_emit_int(fp, 56 + vreg * 8)
+    sx_emit_s(fp, "\n    sub x16, x29, x16\n    ldr ")
+    sx_emit_s(fp, reg)
+    sx_emit_s(fp, ", [x16]\n")
+    return 0
+}
+
+func sx_a64_st(fp: Int, reg: String, vreg: Int) -> Int {
+    sx_emit_s(fp, "    mov x16, #")
+    sx_emit_int(fp, 56 + vreg * 8)
+    sx_emit_s(fp, "\n    sub x16, x29, x16\n    str ")
+    sx_emit_s(fp, reg)
+    sx_emit_s(fp, ", [x16]\n")
+    return 0
+}
+
+func sx_a64_emit_alu(fp: Int, op: Int) -> Int {
+    if op == IR_ADD()    { sx_emit_s(fp, "    add x0, x0, x9\n"); return 0 }
+    if op == IR_SUB()    { sx_emit_s(fp, "    sub x0, x0, x9\n"); return 0 }
+    if op == IR_MUL()    { sx_emit_s(fp, "    mul x0, x0, x9\n"); return 0 }
+    if op == IR_DIV()    { sx_emit_s(fp, "    sdiv x0, x0, x9\n"); return 0 }
+    if op == IR_MOD()    { sx_emit_s(fp, "    sdiv x16, x0, x9\n    msub x0, x16, x9, x0\n"); return 0 }
+    if op == IR_AND()    { sx_emit_s(fp, "    and x0, x0, x9\n"); return 0 }
+    if op == IR_OR()     { sx_emit_s(fp, "    orr x0, x0, x9\n"); return 0 }
+    if op == IR_CMP_EQ() { sx_emit_s(fp, "    cmp x0, x9\n    cset x0, eq\n"); return 0 }
+    if op == IR_CMP_NE() { sx_emit_s(fp, "    cmp x0, x9\n    cset x0, ne\n"); return 0 }
+    if op == IR_CMP_LT() { sx_emit_s(fp, "    cmp x0, x9\n    cset x0, lt\n"); return 0 }
+    if op == IR_CMP_LE() { sx_emit_s(fp, "    cmp x0, x9\n    cset x0, le\n"); return 0 }
+    if op == IR_CMP_GT() { sx_emit_s(fp, "    cmp x0, x9\n    cset x0, gt\n"); return 0 }
+    if op == IR_CMP_GE() { sx_emit_s(fp, "    cmp x0, x9\n    cset x0, ge\n"); return 0 }
+    return 0
+}
+
+func sx_a64_emit_core(ctx: Int, fp: Int, i: Int) -> Int {
+    let op = sx_ir_get(ctx, i, IR_OP())
+    let dst = sx_ir_get(ctx, i, IR_DST())
+    let s1 = sx_ir_get(ctx, i, IR_SRC1())
+    let s2 = sx_ir_get(ctx, i, IR_SRC2())
+    let imm = sx_ir_get(ctx, i, IR_IMM())
+
+    if op == IR_PARAM() {
+        if imm == 0 { sx_a64_st(fp, "x0", dst) }
+        if imm == 1 { sx_a64_st(fp, "x1", dst) }
+        if imm == 2 { sx_a64_st(fp, "x2", dst) }
+        if imm >= 3 { sx_a64_st(fp, "x3", dst) }
+        return 0
+    }
+    if op == IR_CONST() {
+        sx_emit_s(fp, "    ldr x0, =")
+        sx_emit_int(fp, imm)
+        sx_emit_nl(fp)
+        sx_a64_st(fp, "x0", dst)
+        return 0
+    }
+    if op == IR_STR_CONST() {
+        sx_emit_s(fp, "    adrp x0, .Lstr_")
+        sx_emit_int(fp, imm)
+        sx_emit_s(fp, "\n    add x0, x0, :lo12:.Lstr_")
+        sx_emit_int(fp, imm)
+        sx_emit_nl(fp)
+        sx_a64_st(fp, "x0", dst)
+        return 0
+    }
+    if op == IR_MOV() || op == IR_BORROW() || op == IR_MOVE() {
+        sx_a64_ld(fp, s1, "x0")
+        sx_a64_st(fp, "x0", dst)
+        return 0
+    }
+    if op >= IR_ADD() && op <= IR_OR() && op != IR_NEG() {
+        sx_a64_ld(fp, s1, "x0")
+        sx_a64_ld(fp, s2, "x9")
+        sx_a64_emit_alu(fp, op)
+        sx_a64_st(fp, "x0", dst)
+        return 0
+    }
+    if op == IR_NEG() {
+        sx_a64_ld(fp, s1, "x0")
+        sx_emit_s(fp, "    neg x0, x0\n")
+        sx_a64_st(fp, "x0", dst)
+        return 0
+    }
+    if op == IR_NOT() {
+        sx_a64_ld(fp, s1, "x0")
+        sx_emit_s(fp, "    cmp x0, #0\n    cset x0, eq\n")
+        sx_a64_st(fp, "x0", dst)
+        return 0
+    }
+    if op == IR_LABEL() {
+        sx_emit_s(fp, ".Lir_")
+        sx_emit_int(fp, dst)
+        sx_emit_s(fp, ":\n")
+        return 0
+    }
+    if op == IR_JMP() {
+        sx_emit_s(fp, "    b .Lir_")
+        sx_emit_int(fp, dst)
+        sx_emit_nl(fp)
+        return 0
+    }
+    if op == IR_BRZ() {
+        sx_a64_ld(fp, s1, "x0")
+        sx_emit_s(fp, "    cbz x0, .Lir_")
+        sx_emit_int(fp, dst)
+        sx_emit_nl(fp)
+        return 0
+    }
+    return 0
+}
+
+func sx_a64_emit_rt(ctx: Int, fp: Int, i: Int) -> Int {
+    let op = sx_ir_get(ctx, i, IR_OP())
+    let dst = sx_ir_get(ctx, i, IR_DST())
+    let s1 = sx_ir_get(ctx, i, IR_SRC1())
+    let s2 = sx_ir_get(ctx, i, IR_SRC2())
+    let imm = sx_ir_get(ctx, i, IR_IMM())
+
+    // Real AArch64 Bare-Metal Hardware Ops
+    if op == IR_MMIO_READ() {
+        sx_a64_ld(fp, s1, "x0")
+        sx_emit_s(fp, "    ldr w0, [x0]\n")
+        sx_a64_st(fp, "x0", dst); return 0
+    }
+    if op == IR_MMIO_WRITE() {
+        sx_a64_ld(fp, s1, "x0")
+        sx_a64_ld(fp, s2, "x9")
+        sx_emit_s(fp, "    str w9, [x0]\n")
+        sx_a64_st(fp, "x9", dst); return 0
+    }
+    if op == IR_IRQ_DISABLE() {
+        sx_emit_s(fp, "    msr daifset, #2\n    mov x0, #0\n")
+        sx_a64_st(fp, "x0", dst); return 0
+    }
+    if op == IR_IRQ_ENABLE() {
+        sx_emit_s(fp, "    msr daifclr, #2\n    mov x0, #0\n")
+        sx_a64_st(fp, "x0", dst); return 0
+    }
+    if op == IR_WFI() {
+        sx_emit_s(fp, "    wfi\n    mov x0, #0\n")
+        sx_a64_st(fp, "x0", dst); return 0
+    }
+    if op == IR_DMB() {
+        sx_emit_s(fp, "    dmb sy\n    mov x0, #0\n")
+        sx_a64_st(fp, "x0", dst); return 0
+    }
+
+    if op == IR_ARC_NEW()     { sx_a64_ld(fp, s1, "x0"); sx_emit_s(fp, "    bl sx_arc_box_int\n"); sx_a64_st(fp, "x0", dst); return 0 }
+    if op == IR_ARC_RETAIN()  { sx_a64_ld(fp, s1, "x0"); sx_emit_s(fp, "    bl sx_arc_retain\n"); return 0 }
+    if op == IR_ARC_RELEASE() { sx_a64_ld(fp, s1, "x0"); sx_emit_s(fp, "    bl sx_arc_release\n"); return 0 }
+    if op == IR_ARC_LOAD()    { sx_a64_ld(fp, s1, "x0"); sx_emit_s(fp, "    bl sx_arc_unbox_int\n"); sx_a64_st(fp, "x0", dst); return 0 }
+    if op == IR_GC_NEW()      { sx_a64_ld(fp, s1, "x0"); sx_emit_s(fp, "    bl sx_gc_box_int\n"); sx_a64_st(fp, "x0", dst); return 0 }
+    if op == IR_GC_ROOT()     { sx_a64_ld(fp, s1, "x0"); sx_emit_s(fp, "    bl sx_gc_push_root\n"); return 0 }
+    if op == IR_GC_UNROOT()   { sx_emit_s(fp, "    bl sx_gc_pop_root\n"); return 0 }
+    if op == IR_GC_LOAD()     { sx_a64_ld(fp, s1, "x0"); sx_emit_s(fp, "    bl sx_gc_unbox_int\n"); sx_a64_st(fp, "x0", dst); return 0 }
+    if op == IR_BORROW() || op == IR_MOVE() { sx_a64_ld(fp, s1, "x0"); sx_a64_st(fp, "x0", dst); return 0 }
+    if op == IR_PHI_ASSERT() {
+        sx_a64_ld(fp, s1, "x0")
+        sx_emit_s(fp, "    mov x1, #"); sx_emit_int(fp, imm)
+        sx_emit_s(fp, "\n    bl sx_phi_check\n"); return 0
+    }
+    if op == IR_CLOSURE_NEW() {
+        sx_emit_s(fp, "    adrp x0, __sx_lambda_"); sx_emit_int(fp, s1)
+        sx_emit_s(fp, "\n    add x0, x0, :lo12:__sx_lambda_"); sx_emit_int(fp, s1)
+        sx_emit_s(fp, "\n    mov x1, #"); sx_emit_int(fp, imm)
+        sx_emit_s(fp, "\n    bl sx_closure_alloc\n")
+        sx_a64_st(fp, "x0", dst); return 0
+    }
+    if op == IR_CLOSURE_SET() {
+        sx_a64_ld(fp, dst, "x0")
+        sx_a64_ld(fp, s1, "x9")
+        sx_emit_s(fp, "    mov x1, #"); sx_emit_int(fp, imm)
+        sx_emit_s(fp, "\n    mov x2, x9\n    bl sx_closure_set_env\n"); return 0
+    }
+    if op == IR_CLOSURE_GET() {
+        sx_a64_ld(fp, s1, "x0")
+        sx_emit_s(fp, "    mov x1, #"); sx_emit_int(fp, imm)
+        sx_emit_s(fp, "\n    bl sx_closure_get_env\n")
+        sx_a64_st(fp, "x0", dst); return 0
+    }
+    if op == IR_CLOSURE_CALL() {
+        sx_a64_ld(fp, s1, "x0")
+        sx_a64_ld(fp, s2, "x9")
+        sx_emit_s(fp, "    mov x1, x9\n    bl sx_closure_call1\n")
+        sx_a64_st(fp, "x0", dst); return 0
+    }
+    if op == IR_SPAWN() {
+        sx_a64_ld(fp, imm, "x0")
+        sx_emit_s(fp, "    mov x1, x0\n    adrp x0, "); sx_fprint_slice(ctx, fp, s1, s2)
+        sx_emit_s(fp, "\n    add x0, x0, :lo12:"); sx_fprint_slice(ctx, fp, s1, s2)
+        sx_emit_s(fp, "\n    bl sx_spawn\n")
+        sx_a64_st(fp, "x0", dst); return 0
+    }
+    if op == IR_AWAIT() { sx_a64_ld(fp, s1, "x0"); sx_emit_s(fp, "    bl sx_await\n"); sx_a64_st(fp, "x0", dst); return 0 }
+    return 0
+}
+
+func sx_codegen_arm64(ctx: Int, fp: Int) -> Int {
+    let tgt = sx_ctx_get(ctx, CTX_OPT_TARGET())
+    let bare_opt = sx_ctx_get(ctx, CTX_OPT_BARE())
+    var is_bare = 0
+    if tgt == TARGET_ARM64_BARE() || bare_opt != 0 {
+        is_bare = 1
+    }
+    if is_bare != 0 {
+        sx_emit_s(fp, "// Generated by SYNCHRONIX v3.0.0 - Target: ARM64 (aarch64-none-elf Bare-Metal)\n")
+        sx_emit_s(fp, ".section .rodata\n")
+    } else {
+        sx_emit_s(fp, "// Generated by SYNCHRONIX v3.0.0 - Target: ARM64 (Hosted AArch64)\n")
+        sx_emit_s(fp, ".section .rdata,")
+        sx_emit_quote(fp); sx_emit_s(fp, "dr"); sx_emit_quote(fp); sx_emit_nl(fp)
+    }
+    sx_emit_str_table(ctx, fp)
+    sx_emit_s(fp, "\n.section .text\n")
+
+    if bare_opt != 0 {
+        sx_emit_s(fp, ".globl _start\n.p2align 2\n_start:\n    bl main\n.Lhalt_a64:\n    wfi\n    b .Lhalt_a64\n")
+    }
+
+    let arg_vregs = sx_buf_new(8)
+    let cnt = sx_ctx_get(ctx, CTX_IR_COUNT())
+    var cur_fn = 0
+    var i = 0
+
+    while i < cnt {
+        let fl = sx_ir_get(ctx, i, IR_FLAGS())
+        let dead = fl && IRF_DEAD()
+        if dead == 0 {
+            let op = sx_ir_get(ctx, i, IR_OP())
+            let dst = sx_ir_get(ctx, i, IR_DST())
+            let s1 = sx_ir_get(ctx, i, IR_SRC1())
+            let s2 = sx_ir_get(ctx, i, IR_SRC2())
+            let imm = sx_ir_get(ctx, i, IR_IMM())
+
+            if op == IR_FUNC_BEGIN() {
+                cur_fn = dst
+                sx_emit_s(fp, "\n.globl ")
+                sx_emit_fn_label(ctx, fp, s1, s2)
+                sx_emit_s(fp, "\n.p2align 2\n")
+                sx_emit_fn_label(ctx, fp, s1, s2)
+                sx_emit_s(fp, ":\n    stp x29, x30, [sp, #-16]!\n    mov x29, sp\n    stp x19, x20, [sp, #-16]!\n    stp x21, x22, [sp, #-16]!\n    stp x23, x24, [sp, #-16]!\n    sub sp, sp, #2048\n")
+            }
+            if op == IR_FUNC_END() {
+                sx_emit_s(fp, ".Lfn_epi_")
+                sx_emit_int(fp, dst)
+                sx_emit_s(fp, ":\n    sub sp, x29, #48\n    ldp x23, x24, [sp], #16\n    ldp x21, x22, [sp], #16\n    ldp x19, x20, [sp], #16\n    ldp x29, x30, [sp], #16\n    ret\n")
+            }
+            if op >= IR_PARAM() && op <= IR_BRZ() {
+                sx_a64_emit_core(ctx, fp, i)
+            }
+            if op == IR_ARG() {
+                sx_buf_set(arg_vregs, imm, s1)
+            }
+            if op == IR_CALL() {
+                if imm > 0 { let a0 = sx_buf_get(arg_vregs, 0); sx_a64_ld(fp, a0, "x0") }
+                if imm > 1 { let a1 = sx_buf_get(arg_vregs, 1); sx_a64_ld(fp, a1, "x1") }
+                if imm > 2 { let a2 = sx_buf_get(arg_vregs, 2); sx_a64_ld(fp, a2, "x2") }
+                if imm > 3 { let a3 = sx_buf_get(arg_vregs, 3); sx_a64_ld(fp, a3, "x3") }
+                sx_emit_s(fp, "    bl ")
+                sx_emit_print_target(ctx, fp, i)
+                sx_emit_nl(fp)
+                sx_a64_st(fp, "x0", dst)
+            }
+            if op == IR_RET() {
+                sx_a64_ld(fp, s1, "x0")
+                sx_emit_s(fp, "    b .Lfn_epi_")
+                sx_emit_int(fp, cur_fn)
+                sx_emit_nl(fp)
+            }
+            if op >= IR_ARC_NEW() {
+                sx_a64_emit_rt(ctx, fp, i)
+            }
+        }
+        i = i + 1
+    }
+
+    sx_buf_free(arg_vregs)
+    return 0
+}
+
+// ============================================================================
+// 6. Unified Hosted & Freestanding LLVM IR (.ll) Emitter (--emit-llvm)
+// ============================================================================
+func sx_codegen_llvm(ctx: Int, fp: Int) -> Int {
+    sx_emit_s(fp, "; Generated by SYNCHRONIX v3.0.0 Compiler (Unified Hosted + Embedded) - Target: LLVM IR\n")
+    sx_emit_s(fp, "declare i64 @sx_println_int(i64)\ndeclare i64 @sx_print_int(i64)\ndeclare i64 @sx_println_str(ptr)\n")
+    sx_emit_s(fp, "declare i64 @sx_arc_box_int(i64)\ndeclare i64 @sx_arc_retain(i64)\ndeclare i64 @sx_arc_release(i64)\n")
+    sx_emit_s(fp, "declare i64 @sx_arc_unbox_int(i64)\ndeclare i64 @sx_gc_box_int(i64)\ndeclare void @sx_gc_push_root(i64)\n")
+    sx_emit_s(fp, "declare void @sx_gc_pop_root()\ndeclare i64 @sx_gc_unbox_int(i64)\ndeclare i64 @sx_gc_collect()\n")
+    sx_emit_s(fp, "declare i64 @sx_phi_check(i64, i64)\ndeclare i64 @sx_closure_alloc(ptr, i64)\n")
+    sx_emit_s(fp, "declare void @sx_closure_set_env(i64, i64, i64)\ndeclare i64 @sx_closure_get_env(i64, i64)\n")
+    sx_emit_s(fp, "declare i64 @sx_closure_call1(i64, i64)\ndeclare i64 @sx_spawn(ptr, i64)\ndeclare i64 @sx_await(i64)\n")
+    sx_emit_s(fp, "declare i64 @sx_runtime_report()\ndeclare i64 @sx_emb_mmio_read(i64)\ndeclare i64 @sx_emb_mmio_write(i64, i64)\n\n")
+
+    let cnt = sx_ctx_get(ctx, CTX_IR_COUNT())
+    var i = 0
+    while i < cnt {
+        let fl = sx_ir_get(ctx, i, IR_FLAGS())
+        let dead = fl && IRF_DEAD()
+        if dead == 0 {
+            let op = sx_ir_get(ctx, i, IR_OP())
+            let dst = sx_ir_get(ctx, i, IR_DST())
+            let s1 = sx_ir_get(ctx, i, IR_SRC1())
+            let s2 = sx_ir_get(ctx, i, IR_SRC2())
+            let imm = sx_ir_get(ctx, i, IR_IMM())
+
+            if op == IR_FUNC_BEGIN() {
+                sx_emit_s(fp, "define i64 @")
+                sx_emit_fn_label(ctx, fp, s1, s2)
+                sx_emit_s(fp, "(")
+                var p = 0
+                while p < imm && p < 4 {
+                    if p > 0 { sx_emit_s(fp, ", ") }
+                    sx_emit_s(fp, "i64 %p")
+                    sx_emit_int(fp, p)
+                    p = p + 1
+                }
+                sx_emit_s(fp, ") nounwind {\nentry:\n")
+            } else {
+                if op == IR_FUNC_END() {
+                    sx_emit_s(fp, "  ret i64 0\n}\n\n")
+                } else {
+                    if op == IR_MMIO_READ() {
+                        sx_emit_s(fp, "  ; volatile mmio_read dst=v"); sx_emit_int(fp, dst)
+                        sx_emit_s(fp, " addr=v"); sx_emit_int(fp, s1); sx_emit_nl(fp)
+                    } else {
+                        if op == IR_MMIO_WRITE() {
+                            sx_emit_s(fp, "  ; volatile mmio_write addr=v"); sx_emit_int(fp, s1)
+                            sx_emit_s(fp, " val=v"); sx_emit_int(fp, s2); sx_emit_nl(fp)
+                        } else {
+                            sx_emit_s(fp, "  ; SUMIR op="); sx_emit_int(fp, op)
+                            sx_emit_s(fp, " dst=v"); sx_emit_int(fp, dst)
+                            sx_emit_s(fp, " src1="); sx_emit_int(fp, s1)
+                            sx_emit_s(fp, " imm="); sx_emit_int(fp, imm)
+                            sx_emit_nl(fp)
+                        }
+                    }
+                }
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}

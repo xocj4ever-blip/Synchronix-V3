@@ -1,0 +1,756 @@
+// SPDX-License-Identifier: Apache-2.0
+//
+// Copyright 2026 Synchronix Contributors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
+// Full license text: ../../LICENSE
+// End-User License Agreement: ../../EULA.md
+
+// ============================================================================
+// SYNCHRONIX v3.0.0 — Phase 2: Unified IR Generator -> SUMIR
+// (src/middle/ir_gen.synchronix)
+// ============================================================================
+// Lowers Typed AST -> High-Level IR -> SUMIR (Synchronix Unified Memory IR).
+// Full V2 parity + Volatile Embedded Hardware Opcodes:
+//   IR_MMIO_READ, IR_MMIO_WRITE, IR_IRQ_DISABLE, IR_IRQ_ENABLE, IR_WFI, IR_DMB
+// ============================================================================
+
+import sx_defs
+import utils
+
+phi irgen_stride_ok  = 8 == 8
+phi irgen_vreg_start = 1 > 0
+
+// ----------------------------------------------------------------------------
+// SUMIR Emission & Instruction Field Helpers
+// ----------------------------------------------------------------------------
+func sx_new_vreg(ctx: Int) -> Int {
+    let v = sx_ctx_inc(ctx, CTX_NEXT_VREG())
+    return v
+}
+
+func sx_new_label(ctx: Int) -> Int {
+    let l = sx_ctx_inc(ctx, CTX_NEXT_LABEL())
+    return l
+}
+
+func sx_ir_get(ctx: Int, idx: Int, field: Int) -> Int {
+    let buf = sx_ctx_get(ctx, CTX_IR_BUF())
+    let v = sx_buf_get(buf, idx * IR_STRIDE() + field)
+    return v
+}
+
+func sx_ir_set(ctx: Int, idx: Int, field: Int, value: Int) -> Int {
+    let buf = sx_ctx_get(ctx, CTX_IR_BUF())
+    sx_buf_set(buf, idx * IR_STRIDE() + field, value)
+    return value
+}
+
+func sx_ir_emit(ctx: Int, op: Int, dst: Int, src1: Int) -> Int {
+    let idx = sx_ctx_get(ctx, CTX_IR_COUNT())
+    let lim = MAX_IR_INSTS()
+    if idx >= lim {
+        return -1
+    }
+    sx_ctx_set(ctx, CTX_IR_COUNT(), idx + 1)
+    let buf = sx_ctx_get(ctx, CTX_IR_BUF())
+    let base = idx * IR_STRIDE()
+    sx_buf_set(buf, base + IR_OP(), op)
+    sx_buf_set(buf, base + IR_DST(), dst)
+    sx_buf_set(buf, base + IR_SRC1(), src1)
+    sx_buf_set(buf, base + IR_SRC2(), 0)
+    sx_buf_set(buf, base + IR_IMM(), 0)
+    sx_buf_set(buf, base + IR_TYPE(), 0)
+    sx_buf_set(buf, base + IR_FLAGS(), 0)
+    sx_buf_set(buf, base + IR_PHYS(), -1)
+    return idx
+}
+
+func sx_ir_emit2(ctx: Int, op: Int, dst: Int, src1: Int) -> Int {
+    let idx = sx_ir_emit(ctx, op, dst, src1)
+    return idx
+}
+
+// ----------------------------------------------------------------------------
+// Per-Function Local Variable -> Virtual Register Table (stride = 6)
+// ----------------------------------------------------------------------------
+func sx_ir_var_bind(ctx: Int, nstart: Int, nlen: Int, vreg: Int) -> Int {
+    let cnt = sx_ctx_get(ctx, CTX_IR_VAR_CNT())
+    if cnt >= 256 {
+        return -1
+    }
+    sx_ctx_set(ctx, CTX_IR_VAR_CNT(), cnt + 1)
+    let tbl = sx_ctx_get(ctx, CTX_IR_VARS())
+    let base = cnt * 6
+    sx_buf_set(tbl, base + 0, nstart)
+    sx_buf_set(tbl, base + 1, nlen)
+    sx_buf_set(tbl, base + 2, vreg)
+    sx_buf_set(tbl, base + 3, TY_INT())
+    sx_buf_set(tbl, base + 4, OWN_OWNED())
+    return cnt
+}
+
+func sx_ir_var_set_type(ctx: Int, var_idx: Int, ty: Int) -> Int {
+    if var_idx < 0 {
+        return 0
+    }
+    let tbl = sx_ctx_get(ctx, CTX_IR_VARS())
+    sx_buf_set(tbl, var_idx * 6 + 3, ty)
+    return ty
+}
+
+func sx_ir_var_find(ctx: Int, nstart: Int, nlen: Int) -> Int {
+    var i = sx_ctx_get(ctx, CTX_IR_VAR_CNT()) - 1
+    let tbl = sx_ctx_get(ctx, CTX_IR_VARS())
+    while i >= 0 {
+        let base = i * 6
+        let el = sx_buf_get(tbl, base + 1)
+        if el == nlen {
+            let es = sx_buf_get(tbl, base + 0)
+            let eq = sx_src_eq_slice(ctx, nstart, nlen, es)
+            if eq != 0 {
+                return i
+            }
+        }
+        i = i - 1
+    }
+    return -1
+}
+
+// ----------------------------------------------------------------------------
+// ARC / GC Automatic Unboxing Helper
+// ----------------------------------------------------------------------------
+func sx_unbox_if_managed(ctx: Int, vreg: Int, ty: Int) -> Int {
+    if ty == TY_ARC() {
+        let dst = sx_new_vreg(ctx)
+        sx_ir_emit(ctx, IR_ARC_LOAD(), dst, vreg)
+        return dst
+    }
+    if ty == TY_GC() {
+        let dst_g = sx_new_vreg(ctx)
+        sx_ir_emit(ctx, IR_GC_LOAD(), dst_g, vreg)
+        return dst_g
+    }
+    return vreg
+}
+
+func sx_tok_to_ir_binop(tok_op: Int) -> Int {
+    if tok_op == TK_PLUS()    { return IR_ADD() }
+    if tok_op == TK_MINUS()   { return IR_SUB() }
+    if tok_op == TK_STAR()    { return IR_MUL() }
+    if tok_op == TK_SLASH()   { return IR_DIV() }
+    if tok_op == TK_PERCENT() { return IR_MOD() }
+    if tok_op == TK_EQ()      { return IR_CMP_EQ() }
+    if tok_op == TK_NE()      { return IR_CMP_NE() }
+    if tok_op == TK_LT()      { return IR_CMP_LT() }
+    if tok_op == TK_LE()      { return IR_CMP_LE() }
+    if tok_op == TK_GT()      { return IR_CMP_GT() }
+    if tok_op == TK_GE()      { return IR_CMP_GE() }
+    if tok_op == TK_AND()     { return IR_AND() }
+    return IR_OR()
+}
+
+// ----------------------------------------------------------------------------
+// Embedded Hardware Intrinsic Lowering -> Volatile SUMIR
+// ----------------------------------------------------------------------------
+func sx_ir_gen_emb_hw(ctx: Int, expr: Int, out_ty: Int) -> Int {
+    let kind = sx_ast_get(ctx, expr, AST_KIND())
+    let tbox = sx_buf_new(2)
+    let dst = sx_new_vreg(ctx)
+
+    if kind == NK_MMIO_READ() {
+        let addr_n = sx_ast_get(ctx, expr, AST_LEFT())
+        let av0 = sx_ir_gen_expr(ctx, addr_n, tbox)
+        let at = sx_buf_get(tbox, 0)
+        let av = sx_unbox_if_managed(ctx, av0, at)
+        let ridx = sx_ir_emit(ctx, IR_MMIO_READ(), dst, av)
+        sx_ir_set(ctx, ridx, IR_TYPE(), TY_INT())
+        sx_ir_set(ctx, ridx, IR_FLAGS(), IRF_VOLATILE())
+    }
+    if kind == NK_MMIO_WRITE() {
+        let addr_n2 = sx_ast_get(ctx, expr, AST_LEFT())
+        let av1 = sx_ir_gen_expr(ctx, addr_n2, tbox)
+        let at1 = sx_buf_get(tbox, 0)
+        let av2 = sx_unbox_if_managed(ctx, av1, at1)
+
+        let val_n = sx_ast_get(ctx, expr, AST_RIGHT())
+        let vv1 = sx_ir_gen_expr(ctx, val_n, tbox)
+        let vt1 = sx_buf_get(tbox, 0)
+        let vv2 = sx_unbox_if_managed(ctx, vv1, vt1)
+
+        let widx = sx_ir_emit(ctx, IR_MMIO_WRITE(), dst, av2)
+        sx_ir_set(ctx, widx, IR_SRC2(), vv2)
+        sx_ir_set(ctx, widx, IR_TYPE(), TY_INT())
+        sx_ir_set(ctx, widx, IR_FLAGS(), IRF_VOLATILE())
+    }
+    if kind == NK_IRQ_CTRL() {
+        let mode = sx_ast_get(ctx, expr, AST_IVAL())
+        var iop = IR_IRQ_DISABLE()
+        if mode != 0 { iop = IR_IRQ_ENABLE() }
+        let qidx = sx_ir_emit(ctx, iop, dst, 0)
+        sx_ir_set(ctx, qidx, IR_TYPE(), TY_INT())
+        sx_ir_set(ctx, qidx, IR_FLAGS(), IRF_VOLATILE())
+    }
+    if kind == NK_WFI() {
+        let wfidx = sx_ir_emit(ctx, IR_WFI(), dst, 0)
+        sx_ir_set(ctx, wfidx, IR_TYPE(), TY_INT())
+        sx_ir_set(ctx, wfidx, IR_FLAGS(), IRF_VOLATILE())
+    }
+    if kind == NK_DMB() {
+        let dbidx = sx_ir_emit(ctx, IR_DMB(), dst, 0)
+        sx_ir_set(ctx, dbidx, IR_TYPE(), TY_INT())
+        sx_ir_set(ctx, dbidx, IR_FLAGS(), IRF_VOLATILE())
+    }
+
+    if out_ty != 0 {
+        sx_buf_set(out_ty, 0, TY_INT())
+    }
+    sx_buf_free(tbox)
+    return dst
+}
+
+// ----------------------------------------------------------------------------
+// Expression Lowering -> SUMIR Virtual Registers
+// ----------------------------------------------------------------------------
+func sx_ir_gen_lambda(ctx: Int, expr: Int, out_ty: Int) -> Int {
+    let lid = sx_ast_get(ctx, expr, AST_META())
+    let lams = sx_ctx_get(ctx, CTX_LAMBDAS())
+    let lbase = lid * 8
+    let cap_s = sx_buf_get(lams, lbase + 1)
+    let cap_l = sx_buf_get(lams, lbase + 2)
+    var cap_cnt = 0
+    if cap_l > 0 {
+        cap_cnt = 1
+    }
+
+    let dst = sx_new_vreg(ctx)
+    let idx = sx_ir_emit(ctx, IR_CLOSURE_NEW(), dst, lid)
+    sx_ir_set(ctx, idx, IR_IMM(), cap_cnt)
+    sx_ir_set(ctx, idx, IR_TYPE(), TY_CLOSURE())
+    sx_ir_set(ctx, idx, IR_FLAGS(), IRF_ARC())
+
+    if cap_cnt > 0 {
+        let vidx = sx_ir_var_find(ctx, cap_s, cap_l)
+        if vidx >= 0 {
+            let tbl = sx_ctx_get(ctx, CTX_IR_VARS())
+            let cv = sx_buf_get(tbl, vidx * 6 + 2)
+            let ct = sx_buf_get(tbl, vidx * 6 + 3)
+            let unboxed = sx_unbox_if_managed(ctx, cv, ct)
+            let sidx = sx_ir_emit(ctx, IR_CLOSURE_SET(), dst, unboxed)
+            sx_ir_set(ctx, sidx, IR_IMM(), 0)
+        }
+    }
+    if out_ty != 0 {
+        sx_buf_set(out_ty, 0, TY_CLOSURE())
+    }
+    return dst
+}
+
+func sx_ir_gen_call(ctx: Int, expr: Int, out_ty: Int) -> Int {
+    let avregs = sx_buf_new(8)
+    let atypes = sx_buf_new(8)
+    let tbox = sx_buf_new(2)
+    var argc = 0
+    var arg = sx_ast_get(ctx, expr, AST_RIGHT())
+    while arg != 0 && argc < 8 {
+        let av = sx_ir_gen_expr(ctx, arg, tbox)
+        let at = sx_buf_get(tbox, 0)
+        let uv = sx_unbox_if_managed(ctx, av, at)
+        sx_buf_set(avregs, argc, uv)
+        sx_buf_set(atypes, argc, at)
+        argc = argc + 1
+        arg = sx_ast_get(ctx, arg, AST_NEXT())
+    }
+
+    let ns = sx_ast_get(ctx, expr, AST_NAME_START())
+    let nl = sx_ast_get(ctx, expr, AST_NAME_LEN())
+
+    let vidx = sx_ir_var_find(ctx, ns, nl)
+    if vidx >= 0 {
+        let tbl = sx_ctx_get(ctx, CTX_IR_VARS())
+        let vty = sx_buf_get(tbl, vidx * 6 + 3)
+        if vty == TY_CLOSURE() {
+            let cl_vreg = sx_buf_get(tbl, vidx * 6 + 2)
+            let a0 = sx_buf_get(avregs, 0)
+            let cdst = sx_new_vreg(ctx)
+            let cidx = sx_ir_emit(ctx, IR_CLOSURE_CALL(), cdst, cl_vreg)
+            sx_ir_set(ctx, cidx, IR_SRC2(), a0)
+            sx_ir_set(ctx, cidx, IR_TYPE(), TY_INT())
+            if out_ty != 0 {
+                sx_buf_set(out_ty, 0, TY_INT())
+            }
+            sx_buf_free(avregs)
+            sx_buf_free(atypes)
+            sx_buf_free(tbox)
+            return cdst
+        }
+    }
+
+    var i = 0
+    while i < argc {
+        let rv = sx_buf_get(avregs, i)
+        let aidx = sx_ir_emit(ctx, IR_ARG(), 0, rv)
+        sx_ir_set(ctx, aidx, IR_IMM(), i)
+        i = i + 1
+    }
+
+    let dst = sx_new_vreg(ctx)
+    let first_arg_ty = sx_buf_get(atypes, 0)
+    let kidx = sx_ir_emit(ctx, IR_CALL(), dst, ns)
+    sx_ir_set(ctx, kidx, IR_SRC2(), nl)
+    sx_ir_set(ctx, kidx, IR_IMM(), argc)
+    sx_ir_set(ctx, kidx, IR_TYPE(), first_arg_ty)
+
+    if out_ty != 0 {
+        sx_buf_set(out_ty, 0, TY_INT())
+    }
+    sx_buf_free(avregs)
+    sx_buf_free(atypes)
+    sx_buf_free(tbox)
+    return dst
+}
+
+func sx_ir_gen_binop(ctx: Int, expr: Int, out_ty: Int) -> Int {
+    let tbox = sx_buf_new(2)
+    let ln = sx_ast_get(ctx, expr, AST_LEFT())
+    let lv0 = sx_ir_gen_expr(ctx, ln, tbox)
+    let lt = sx_buf_get(tbox, 0)
+    let lv = sx_unbox_if_managed(ctx, lv0, lt)
+
+    let rn = sx_ast_get(ctx, expr, AST_RIGHT())
+    let rv0 = sx_ir_gen_expr(ctx, rn, tbox)
+    let rt = sx_buf_get(tbox, 0)
+    let rv = sx_unbox_if_managed(ctx, rv0, rt)
+
+    let dst = sx_new_vreg(ctx)
+    let tok_op = sx_ast_get(ctx, expr, AST_IVAL())
+    let irop = sx_tok_to_ir_binop(tok_op)
+    let idx = sx_ir_emit(ctx, irop, dst, lv)
+    sx_ir_set(ctx, idx, IR_SRC2(), rv)
+    sx_ir_set(ctx, idx, IR_TYPE(), TY_INT())
+    if out_ty != 0 {
+        sx_buf_set(out_ty, 0, TY_INT())
+    }
+    sx_buf_free(tbox)
+    return dst
+}
+
+func sx_ir_gen_ident(ctx: Int, expr: Int, out_ty: Int) -> Int {
+    let ns = sx_ast_get(ctx, expr, AST_NAME_START())
+    let nl = sx_ast_get(ctx, expr, AST_NAME_LEN())
+
+    let cap_l = sx_ctx_get(ctx, CTX_CUR_LAM_CAP_L())
+    if cap_l > 0 && cap_l == nl {
+        let cap_s = sx_ctx_get(ctx, CTX_CUR_LAM_CAP_S())
+        let eq = sx_src_eq_slice(ctx, ns, nl, cap_s)
+        if eq != 0 {
+            let dst = sx_new_vreg(ctx)
+            let cl_v = sx_ctx_get(ctx, CTX_CUR_LAM_CL())
+            let gidx = sx_ir_emit(ctx, IR_CLOSURE_GET(), dst, cl_v)
+            sx_ir_set(ctx, gidx, IR_IMM(), 0)
+            sx_ir_set(ctx, gidx, IR_TYPE(), TY_INT())
+            if out_ty != 0 {
+                sx_buf_set(out_ty, 0, TY_INT())
+            }
+            return dst
+        }
+    }
+
+    let vidx = sx_ir_var_find(ctx, ns, nl)
+    if vidx >= 0 {
+        let tbl = sx_ctx_get(ctx, CTX_IR_VARS())
+        let vr = sx_buf_get(tbl, vidx * 6 + 2)
+        let vt = sx_buf_get(tbl, vidx * 6 + 3)
+        if out_ty != 0 {
+            sx_buf_set(out_ty, 0, vt)
+        }
+        return vr
+    }
+
+    let zv = sx_new_vreg(ctx)
+    sx_ir_emit(ctx, IR_CONST(), zv, 0)
+    if out_ty != 0 {
+        sx_buf_set(out_ty, 0, TY_INT())
+    }
+    return zv
+}
+
+func sx_ir_gen_expr(ctx: Int, expr: Int, out_ty: Int) -> Int {
+    if expr <= 0 {
+        let z = sx_new_vreg(ctx)
+        sx_ir_emit(ctx, IR_CONST(), z, 0)
+        return z
+    }
+    let kind = sx_ast_get(ctx, expr, AST_KIND())
+
+    if kind == NK_INT() {
+        let dst = sx_new_vreg(ctx)
+        let idx = sx_ir_emit(ctx, IR_CONST(), dst, 0)
+        let iv = sx_ast_get(ctx, expr, AST_IVAL())
+        sx_ir_set(ctx, idx, IR_IMM(), iv)
+        sx_ir_set(ctx, idx, IR_TYPE(), TY_INT())
+        if out_ty != 0 { sx_buf_set(out_ty, 0, TY_INT()) }
+        return dst
+    }
+    if kind == NK_STR() {
+        let ss = sx_ast_get(ctx, expr, AST_NAME_START())
+        let sl = sx_ast_get(ctx, expr, AST_NAME_LEN())
+        let sid = sx_intern_string(ctx, ss, sl)
+        let sdst = sx_new_vreg(ctx)
+        let sidx = sx_ir_emit(ctx, IR_STR_CONST(), sdst, ss)
+        sx_ir_set(ctx, sidx, IR_SRC2(), sl)
+        sx_ir_set(ctx, sidx, IR_IMM(), sid)
+        sx_ir_set(ctx, sidx, IR_TYPE(), TY_STR())
+        if out_ty != 0 { sx_buf_set(out_ty, 0, TY_STR()) }
+        return sdst
+    }
+    if kind == NK_IDENT() {
+        let iv = sx_ir_gen_ident(ctx, expr, out_ty)
+        return iv
+    }
+    if kind == NK_BINOP() {
+        let bv = sx_ir_gen_binop(ctx, expr, out_ty)
+        return bv
+    }
+    if kind == NK_CALL() {
+        let cv = sx_ir_gen_call(ctx, expr, out_ty)
+        return cv
+    }
+    if kind == NK_LAMBDA() {
+        let lv = sx_ir_gen_lambda(ctx, expr, out_ty)
+        return lv
+    }
+    if kind >= NK_MMIO_READ() && kind <= NK_DMB() {
+        let hv = sx_ir_gen_emb_hw(ctx, expr, out_ty)
+        return hv
+    }
+
+    let tbox = sx_buf_new(2)
+    let child = sx_ast_get(ctx, expr, AST_LEFT())
+    let cv0 = sx_ir_gen_expr(ctx, child, tbox)
+    let ct = sx_buf_get(tbox, 0)
+    var res_v = cv0
+    var res_t = ct
+
+    if kind == NK_ARC_NEW() {
+        let u = sx_unbox_if_managed(ctx, cv0, ct)
+        let ad = sx_new_vreg(ctx)
+        let ai = sx_ir_emit(ctx, IR_ARC_NEW(), ad, u)
+        sx_ir_set(ctx, ai, IR_TYPE(), TY_ARC())
+        sx_ir_set(ctx, ai, IR_FLAGS(), IRF_ARC())
+        res_v = ad
+        res_t = TY_ARC()
+    }
+    if kind == NK_GC_NEW() {
+        let ug = sx_unbox_if_managed(ctx, cv0, ct)
+        let gd = sx_new_vreg(ctx)
+        let gi = sx_ir_emit(ctx, IR_GC_NEW(), gd, ug)
+        sx_ir_set(ctx, gi, IR_TYPE(), TY_GC())
+        sx_ir_set(ctx, gi, IR_FLAGS(), IRF_GC())
+        res_v = gd
+        res_t = TY_GC()
+    }
+    if kind == NK_BORROW() {
+        let bd = sx_new_vreg(ctx)
+        let bi = sx_ir_emit(ctx, IR_BORROW(), bd, cv0)
+        sx_ir_set(ctx, bi, IR_TYPE(), ct)
+        res_v = bd
+        res_t = ct
+    }
+    if kind == NK_MOVE() {
+        let md = sx_new_vreg(ctx)
+        let mi = sx_ir_emit(ctx, IR_MOVE(), md, cv0)
+        sx_ir_set(ctx, mi, IR_TYPE(), ct)
+        res_v = md
+        res_t = ct
+    }
+    if kind == NK_UNOP() {
+        let uu = sx_unbox_if_managed(ctx, cv0, ct)
+        let ud = sx_new_vreg(ctx)
+        let uop = sx_ast_get(ctx, expr, AST_IVAL())
+        var irop = IR_NOT()
+        if uop == TK_MINUS() { irop = IR_NEG() }
+        sx_ir_emit(ctx, irop, ud, uu)
+        res_v = ud
+        res_t = TY_INT()
+    }
+    if kind == NK_SPAWN() {
+        let us = sx_unbox_if_managed(ctx, cv0, ct)
+        let sd = sx_new_vreg(ctx)
+        let fns = sx_ast_get(ctx, expr, AST_NAME_START())
+        let fnl = sx_ast_get(ctx, expr, AST_NAME_LEN())
+        let si = sx_ir_emit(ctx, IR_SPAWN(), sd, fns)
+        sx_ir_set(ctx, si, IR_SRC2(), fnl)
+        sx_ir_set(ctx, si, IR_IMM(), us)
+        sx_ir_set(ctx, si, IR_TYPE(), TY_TASK())
+        res_v = sd
+        res_t = TY_TASK()
+    }
+    if kind == NK_AWAIT() {
+        let wd = sx_new_vreg(ctx)
+        sx_ir_emit(ctx, IR_AWAIT(), wd, cv0)
+        res_v = wd
+        res_t = TY_INT()
+    }
+
+    if out_ty != 0 {
+        sx_buf_set(out_ty, 0, res_t)
+    }
+    sx_buf_free(tbox)
+    return res_v
+}
+
+// ----------------------------------------------------------------------------
+// Statement & Program Lowering -> SUMIR
+// ----------------------------------------------------------------------------
+func sx_ir_gen_stmt(ctx: Int, stmt: Int) -> Int {
+    if stmt <= 0 {
+        return 0
+    }
+    let kind = sx_ast_get(ctx, stmt, AST_KIND())
+
+    if kind == NK_BLOCK() {
+        var cur = sx_ast_get(ctx, stmt, AST_LEFT())
+        while cur != 0 {
+            sx_ir_gen_stmt(ctx, cur)
+            cur = sx_ast_get(ctx, cur, AST_NEXT())
+        }
+        return 0
+    }
+    if kind == NK_LET() {
+        let tbox = sx_buf_new(2)
+        let rhs = sx_ast_get(ctx, stmt, AST_LEFT())
+        let rv = sx_ir_gen_expr(ctx, rhs, tbox)
+        let rt = sx_buf_get(tbox, 0)
+        let dst = sx_new_vreg(ctx)
+        let midx = sx_ir_emit(ctx, IR_MOV(), dst, rv)
+        sx_ir_set(ctx, midx, IR_TYPE(), rt)
+        if rt == TY_ARC() {
+            let rkind = sx_ast_get(ctx, rhs, AST_KIND())
+            if rkind == NK_IDENT() {
+                sx_ir_set(ctx, midx, IR_FLAGS(), IRF_ARC())
+            }
+        }
+        if rt == TY_GC() {
+            sx_ir_set(ctx, midx, IR_FLAGS(), IRF_GC())
+        }
+        let ns = sx_ast_get(ctx, stmt, AST_NAME_START())
+        let nl = sx_ast_get(ctx, stmt, AST_NAME_LEN())
+        let vidx = sx_ir_var_bind(ctx, ns, nl, dst)
+        sx_ir_var_set_type(ctx, vidx, rt)
+        sx_buf_free(tbox)
+        return 0
+    }
+    if kind == NK_ASSIGN() {
+        let tbox2 = sx_buf_new(2)
+        let rhs2 = sx_ast_get(ctx, stmt, AST_LEFT())
+        let rv2 = sx_ir_gen_expr(ctx, rhs2, tbox2)
+        let rt2 = sx_buf_get(tbox2, 0)
+        let uv2 = sx_unbox_if_managed(ctx, rv2, rt2)
+        let as_s = sx_ast_get(ctx, stmt, AST_NAME_START())
+        let as_l = sx_ast_get(ctx, stmt, AST_NAME_LEN())
+        let fidx = sx_ir_var_find(ctx, as_s, as_l)
+        if fidx >= 0 {
+            let tbl = sx_ctx_get(ctx, CTX_IR_VARS())
+            let dst2 = sx_buf_get(tbl, fidx * 6 + 2)
+            sx_ir_emit(ctx, IR_MOV(), dst2, uv2)
+        }
+        sx_buf_free(tbox2)
+        return 0
+    }
+    if kind == NK_RETURN() {
+        let re = sx_ast_get(ctx, stmt, AST_LEFT())
+        var rv3 = 0
+        if re != 0 {
+            let tbox3 = sx_buf_new(2)
+            let r0 = sx_ir_gen_expr(ctx, re, tbox3)
+            let rt3 = sx_buf_get(tbox3, 0)
+            rv3 = sx_unbox_if_managed(ctx, r0, rt3)
+            sx_buf_free(tbox3)
+        } else {
+            rv3 = sx_new_vreg(ctx)
+            sx_ir_emit(ctx, IR_CONST(), rv3, 0)
+        }
+        sx_ir_emit(ctx, IR_RET(), 0, rv3)
+        return 0
+    }
+    if kind == NK_IF() {
+        let else_l = sx_new_label(ctx)
+        let end_l = sx_new_label(ctx)
+        let cond = sx_ast_get(ctx, stmt, AST_LEFT())
+        let cv = sx_ir_gen_expr(ctx, cond, 0)
+        sx_ir_emit(ctx, IR_BRZ(), else_l, cv)
+        let thn = sx_ast_get(ctx, stmt, AST_RIGHT())
+        sx_ir_gen_stmt(ctx, thn)
+        sx_ir_emit(ctx, IR_JMP(), end_l, 0)
+        sx_ir_emit(ctx, IR_LABEL(), else_l, 0)
+        let els = sx_ast_get(ctx, stmt, AST_EXTRA())
+        sx_ir_gen_stmt(ctx, els)
+        sx_ir_emit(ctx, IR_LABEL(), end_l, 0)
+        return 0
+    }
+    if kind == NK_WHILE() {
+        let top_l = sx_new_label(ctx)
+        let end_l2 = sx_new_label(ctx)
+        sx_ir_emit(ctx, IR_LABEL(), top_l, 0)
+        let wcond = sx_ast_get(ctx, stmt, AST_LEFT())
+        let wv = sx_ir_gen_expr(ctx, wcond, 0)
+        sx_ir_emit(ctx, IR_BRZ(), end_l2, wv)
+        let wbody = sx_ast_get(ctx, stmt, AST_RIGHT())
+        sx_ir_gen_stmt(ctx, wbody)
+        sx_ir_emit(ctx, IR_JMP(), top_l, 0)
+        sx_ir_emit(ctx, IR_LABEL(), end_l2, 0)
+        return 0
+    }
+    if kind == NK_PROVE() {
+        let pe = sx_ast_get(ctx, stmt, AST_LEFT())
+        let pv = sx_ir_gen_expr(ctx, pe, 0)
+        let pidx = sx_ir_emit(ctx, IR_PHI_ASSERT(), 0, pv)
+        let pline = sx_ast_get(ctx, stmt, AST_LINE())
+        sx_ir_set(ctx, pidx, IR_IMM(), pline)
+        let pmeta = sx_ast_get(ctx, stmt, AST_META())
+        if pmeta == PHI_PROVEN_STATIC() {
+            sx_ir_set(ctx, pidx, IR_FLAGS(), IRF_PROVEN())
+        }
+        return 0
+    }
+    if kind == NK_EXPR_STMT() {
+        let ee = sx_ast_get(ctx, stmt, AST_LEFT())
+        sx_ir_gen_expr(ctx, ee, 0)
+        return 0
+    }
+    return 0
+}
+
+func sx_ir_gen_func(ctx: Int, decl: Int) -> Int {
+    let body = sx_ast_get(ctx, decl, AST_RIGHT())
+    if body == 0 {
+        return 0
+    }
+    sx_ctx_set(ctx, CTX_IR_VAR_CNT(), 0)
+    sx_ctx_set(ctx, CTX_NEXT_VREG(), 1)
+
+    var pcnt = 0
+    var p = sx_ast_get(ctx, decl, AST_LEFT())
+    while p != 0 {
+        pcnt = pcnt + 1
+        p = sx_ast_get(ctx, p, AST_NEXT())
+    }
+
+    let fid = sx_ctx_inc(ctx, CTX_IR_FUNC_CNT())
+    let ns = sx_ast_get(ctx, decl, AST_NAME_START())
+    let nl = sx_ast_get(ctx, decl, AST_NAME_LEN())
+    let ffl = sx_ast_get(ctx, decl, AST_IVAL())
+    var ir_fl = 0
+    if (ffl && FL_IRQ()) != 0     { ir_fl = ir_fl || IRF_IRQ() }
+    if (ffl && FL_NOALLOC()) != 0 { ir_fl = ir_fl || IRF_NOALLOC() }
+
+    let fb = sx_ir_emit(ctx, IR_FUNC_BEGIN(), fid, ns)
+    sx_ir_set(ctx, fb, IR_SRC2(), nl)
+    sx_ir_set(ctx, fb, IR_IMM(), pcnt)
+    sx_ir_set(ctx, fb, IR_FLAGS(), ir_fl)
+
+    var pidx = 0
+    var p2 = sx_ast_get(ctx, decl, AST_LEFT())
+    while p2 != 0 {
+        let pv = sx_new_vreg(ctx)
+        let pi = sx_ir_emit(ctx, IR_PARAM(), pv, 0)
+        sx_ir_set(ctx, pi, IR_IMM(), pidx)
+        let ps = sx_ast_get(ctx, p2, AST_NAME_START())
+        let pl = sx_ast_get(ctx, p2, AST_NAME_LEN())
+        let pt = sx_ast_get(ctx, p2, AST_TYPE())
+        let bidx = sx_ir_var_bind(ctx, ps, pl, pv)
+        sx_ir_var_set_type(ctx, bidx, pt)
+        pidx = pidx + 1
+        p2 = sx_ast_get(ctx, p2, AST_NEXT())
+    }
+
+    let req = sx_ast_get(ctx, decl, AST_EXTRA())
+    if req != 0 {
+        let rv = sx_ir_gen_expr(ctx, req, 0)
+        let ai = sx_ir_emit(ctx, IR_PHI_ASSERT(), 0, rv)
+        let line = sx_ast_get(ctx, decl, AST_LINE())
+        sx_ir_set(ctx, ai, IR_IMM(), line)
+        let meta = sx_ast_get(ctx, decl, AST_META())
+        if meta == PHI_PROVEN_STATIC() {
+            sx_ir_set(ctx, ai, IR_FLAGS(), IRF_PROVEN())
+        }
+    }
+
+    sx_ir_gen_stmt(ctx, body)
+    sx_ir_emit(ctx, IR_FUNC_END(), fid, 0)
+    return 0
+}
+
+func sx_ir_gen_lifted_lambdas(ctx: Int) -> Int {
+    let lcnt = sx_ctx_get(ctx, CTX_LAMBDA_COUNT())
+    let lams = sx_ctx_get(ctx, CTX_LAMBDAS())
+    var lid = 0
+    while lid < lcnt {
+        let lbase = lid * 8
+        let lnode = sx_buf_get(lams, lbase + 0)
+        let cap_s = sx_buf_get(lams, lbase + 1)
+        let cap_l = sx_buf_get(lams, lbase + 2)
+        let ps = sx_buf_get(lams, lbase + 4)
+        let pl = sx_buf_get(lams, lbase + 5)
+
+        sx_ctx_set(ctx, CTX_IR_VAR_CNT(), 0)
+        sx_ctx_set(ctx, CTX_NEXT_VREG(), 1)
+        let fid = sx_ctx_inc(ctx, CTX_IR_FUNC_CNT())
+
+        let fb = sx_ir_emit(ctx, IR_FUNC_BEGIN(), fid, lid)
+        sx_ir_set(ctx, fb, IR_SRC2(), -1)
+        sx_ir_set(ctx, fb, IR_IMM(), 2)
+
+        let cl_v = sx_new_vreg(ctx)
+        let p0i = sx_ir_emit(ctx, IR_PARAM(), cl_v, 0)
+        sx_ir_set(ctx, p0i, IR_IMM(), 0)
+
+        let arg_v = sx_new_vreg(ctx)
+        let p1i = sx_ir_emit(ctx, IR_PARAM(), arg_v, 0)
+        sx_ir_set(ctx, p1i, IR_IMM(), 1)
+        sx_ir_var_bind(ctx, ps, pl, arg_v)
+
+        sx_ctx_set(ctx, CTX_CUR_LAM_CL(), cl_v)
+        sx_ctx_set(ctx, CTX_CUR_LAM_CAP_S(), cap_s)
+        sx_ctx_set(ctx, CTX_CUR_LAM_CAP_L(), cap_l)
+
+        let lbody = sx_ast_get(ctx, lnode, AST_RIGHT())
+        let res_v = sx_ir_gen_expr(ctx, lbody, 0)
+        sx_ir_emit(ctx, IR_RET(), 0, res_v)
+        sx_ir_emit(ctx, IR_FUNC_END(), fid, 0)
+
+        sx_ctx_set(ctx, CTX_CUR_LAM_CAP_L(), 0)
+        lid = lid + 1
+    }
+    return 0
+}
+
+func sx_ir_gen_program(ctx: Int, root: Int) -> Int {
+    sx_ctx_set(ctx, CTX_IR_FUNC_CNT(), 0)
+    sx_ctx_set(ctx, CTX_CUR_LAM_CAP_L(), 0)
+
+    var decl = sx_ast_get(ctx, root, AST_LEFT())
+    while decl != 0 {
+        let dkind = sx_ast_get(ctx, decl, AST_KIND())
+        if dkind == NK_FUNC() {
+            sx_ir_gen_func(ctx, decl)
+        }
+        decl = sx_ast_get(ctx, decl, AST_NEXT())
+    }
+
+    sx_ir_gen_lifted_lambdas(ctx)
+    let cnt = sx_ctx_get(ctx, CTX_IR_COUNT())
+    return cnt
+}

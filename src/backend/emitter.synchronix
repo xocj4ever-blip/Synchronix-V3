@@ -1,0 +1,377 @@
+// SPDX-License-Identifier: Apache-2.0
+//
+// Copyright 2026 Synchronix Contributors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
+// Full license text: ../../LICENSE
+// End-User License Agreement: ../../EULA.md
+
+// ============================================================================
+// SYNCHRONIX v3.0.0 — Phase 3: Unified 6-Target Pipeline, Assembler & Linker
+// (src/backend/emitter.synchronix)
+// ============================================================================
+// Full 3-Phase Compiler Pipeline + Unified Hosted & Bare-Metal Backend Driver:
+//   - x86_64      : Host native executable via clang -fuse-ld=lld + v3 host RT
+//   - arm64       : Hosted ARM64 via clang --target=aarch64-w64-windows-gnu
+//                   (or bare-metal aarch64-none-elf + lld ELF when --bare)
+//   - arm64-bare  : Bare-metal ARM64 via clang --target=aarch64-none-elf (+ lld)
+//   - cortex-m    : ARM Cortex-M4 Thumb-2 via clang --target=thumbv7em-none-eabi
+//                   (+ ld.lld bare-metal ELF & llvm-size Flash/RAM when --bare)
+//   - x86_64-bare : Freestanding x86_64 via clang --target=x86_64-none-elf (+ lld)
+//   - llvm        : Unified Hosted & Freestanding LLVM IR (.ll)
+// ============================================================================
+
+import sx_defs
+import portable_asm
+import utils
+import lexer
+import parser
+import sema
+import ir_gen
+import lowering
+import target_opt
+import codegen
+
+extern func system(cmd: Int) -> Int;
+extern func sx_print_str(s: Int) -> Int;
+extern func sx_println_str(s: Int) -> Int;
+
+phi emitter_phases_count = 3 == 3
+phi emitter_targets_ok   = 6 >= 5
+
+// ----------------------------------------------------------------------------
+// Locate Unified Host Runtime Archive (includes core RT + HAL simulator)
+// ----------------------------------------------------------------------------
+func sx_find_rt_lib() -> Int {
+    if sx_file_exists("build/libsynchronix_v3_host.a") != 0 {
+        return "build/libsynchronix_v3_host.a"
+    }
+    if sx_file_exists("build/libsynchronix_emb_host.a") != 0 {
+        return "build/libsynchronix_emb_host.a"
+    }
+    if sx_file_exists("build/libsynchronix_rt.a") != 0 {
+        return "build/libsynchronix_rt.a"
+    }
+    return "libsynchronix_rt.a"
+}
+
+// ----------------------------------------------------------------------------
+// Native Host x86_64 Linker
+// ----------------------------------------------------------------------------
+func sx_link_x86_64(ctx: Int, asm_path: Int, out_path: Int) -> Int {
+    let rt_lib = sx_find_rt_lib()
+    let dbg = sx_ctx_get(ctx, CTX_OPT_DEBUG())
+    let ext_lib = sx_ctx_get(ctx, CTX_OPT_EXT_LIB())
+
+    let cmd = sx_cstr_alloc(2048)
+    sx_cstr_copy(cmd, "clang -fuse-ld=lld")
+    if dbg != 0 {
+        sx_cstr_cat(cmd, " -g")
+    }
+    sx_cstr_cat(cmd, " ")
+    sx_cstr_cat_quoted(cmd, asm_path)
+    sx_cstr_cat(cmd, " ")
+    sx_cstr_cat_quoted(cmd, rt_lib)
+
+    if ext_lib != 0 {
+        sx_cstr_cat(cmd, " ")
+        sx_cstr_cat_quoted(cmd, ext_lib)
+    }
+
+    sx_cstr_cat(cmd, " -o ")
+    sx_cstr_cat_quoted(cmd, out_path)
+
+    let rc = system(cmd)
+    sx_cstr_free(cmd)
+
+    if rc != 0 {
+        print("[Synchronix v3 Error] Host Assembler/Linker failed (exit=")
+        print(rc)
+        println(").")
+        return 1
+    }
+    print("[Synchronix v3 Backend] Linked native executable: ")
+    sx_println_str(out_path)
+    return 0
+}
+
+// ----------------------------------------------------------------------------
+// Hosted ARM64 (AArch64) Cross-Assembler (Main V2 Parity)
+// ----------------------------------------------------------------------------
+func sx_assemble_arm64_host(asm_path: Int, out_path: Int) -> Int {
+    let obj_path = sx_cstr_alloc(512)
+    sx_cstr_copy(obj_path, out_path)
+    sx_cstr_cat(obj_path, ".o")
+
+    let cmd = sx_cstr_alloc(2048)
+    sx_cstr_copy(cmd, "clang --target=aarch64-w64-windows-gnu -c ")
+    sx_cstr_cat_quoted(cmd, asm_path)
+    sx_cstr_cat(cmd, " -o ")
+    sx_cstr_cat_quoted(cmd, obj_path)
+
+    let rc = system(cmd)
+    sx_cstr_free(cmd)
+
+    if rc != 0 {
+        sx_cstr_free(obj_path)
+        print("[Synchronix v3 Error] ARM64 Host Assembler failed (exit=")
+        print(rc)
+        println(").")
+        return 1
+    }
+    print("[Synchronix v3 Backend] Assembled hosted ARM64 object: ")
+    sx_println_str(obj_path)
+    sx_cstr_free(obj_path)
+    return 0
+}
+
+// ----------------------------------------------------------------------------
+// Bare-Metal Cross-Assembler & Freestanding ELF Linker (ld.lld + llvm-size)
+// ----------------------------------------------------------------------------
+func sx_link_bare_elf(ctx: Int, obj_path: Int, out_path: Int, entry_sym: Int) -> Int {
+    let elf_path = sx_cstr_alloc(512)
+    sx_cstr_copy(elf_path, out_path)
+    sx_cstr_cat(elf_path, ".elf")
+
+    let cmd = sx_cstr_alloc(2048)
+    sx_cstr_copy(cmd, "ld.lld --gc-sections -e ")
+    sx_cstr_cat(cmd, entry_sym)
+    sx_cstr_cat(cmd, " ")
+    sx_cstr_cat_quoted(cmd, obj_path)
+
+    let ext_lib = sx_ctx_get(ctx, CTX_OPT_EXT_LIB())
+    if ext_lib != 0 {
+        sx_cstr_cat(cmd, " ")
+        sx_cstr_cat_quoted(cmd, ext_lib)
+    }
+
+    sx_cstr_cat(cmd, " -o ")
+    sx_cstr_cat_quoted(cmd, elf_path)
+
+    let rc = system(cmd)
+    if rc != 0 {
+        sx_cstr_free(cmd)
+        sx_cstr_free(elf_path)
+        print("[Synchronix v3 Error] Bare-metal ELF link failed (exit=")
+        print(rc)
+        println(").")
+        return 1
+    }
+    print("[Synchronix v3 Backend] Linked bare-metal firmware ELF: ")
+    sx_println_str(elf_path)
+
+    sx_cstr_copy(cmd, "llvm-size ")
+    sx_cstr_cat_quoted(cmd, elf_path)
+    system(cmd)
+
+    sx_cstr_free(cmd)
+    sx_cstr_free(elf_path)
+    return 0
+}
+
+func sx_assemble_bare_target(ctx: Int, asm_path: Int, out_path: Int, tgt: Int) -> Int {
+    let obj_path = sx_cstr_alloc(512)
+    sx_cstr_copy(obj_path, out_path)
+    sx_cstr_cat(obj_path, ".o")
+
+    let cmd = sx_cstr_alloc(2048)
+    if tgt == TARGET_CORTEX_M() {
+        sx_cstr_copy(cmd, "clang --target=thumbv7em-none-eabi -mcpu=cortex-m4 -mthumb -c ")
+    } else {
+        if tgt == TARGET_ARM64_BARE() || tgt == TARGET_ARM64() {
+            sx_cstr_copy(cmd, "clang --target=aarch64-none-elf -c ")
+        } else {
+            sx_cstr_copy(cmd, "clang --target=x86_64-none-elf -c ")
+        }
+    }
+    sx_cstr_cat_quoted(cmd, asm_path)
+    sx_cstr_cat(cmd, " -o ")
+    sx_cstr_cat_quoted(cmd, obj_path)
+
+    let rc = system(cmd)
+    sx_cstr_free(cmd)
+
+    if rc != 0 {
+        sx_cstr_free(obj_path)
+        print("[Synchronix v3 Error] Bare-metal Cross-Assembler failed (exit=")
+        print(rc)
+        println(").")
+        return 1
+    }
+
+    if tgt == TARGET_CORTEX_M() {
+        print("[Synchronix v3 Backend] Assembled Cortex-M4 Thumb-2 object: ")
+    } else {
+        if tgt == TARGET_ARM64_BARE() || tgt == TARGET_ARM64() {
+            print("[Synchronix v3 Backend] Assembled bare-metal ARM64 object: ")
+        } else {
+            print("[Synchronix v3 Backend] Assembled bare-metal x86_64 object: ")
+        }
+    }
+    sx_println_str(obj_path)
+
+    let bare_link = sx_ctx_get(ctx, CTX_OPT_BARE())
+    var lrc = 0
+    if bare_link != 0 {
+        var entry_s = "_start"
+        if tgt == TARGET_CORTEX_M() {
+            entry_s = "Reset_Handler"
+        }
+        lrc = sx_link_bare_elf(ctx, obj_path, out_path, entry_s)
+    }
+    sx_cstr_free(obj_path)
+    return lrc
+}
+
+// ----------------------------------------------------------------------------
+// sx_compile_file(ctx, src_path, out_path) -> 0 on success else 1
+// ----------------------------------------------------------------------------
+func sx_compile_file(ctx: Int, src_path: Int, out_path: Int) -> Int {
+    sx_ctx_reset(ctx)
+
+    // --- PHASE 1: FRONTEND (ANALYSIS, PHI PROOFS & EMBEDDED SAFETY) ---
+    let nbytes = sx_read_source_file(ctx, src_path)
+    if nbytes < 0 {
+        print("[Synchronix v3 Error] Cannot open source file: ")
+        sx_println_str(src_path)
+        return 1
+    }
+
+    sx_lex(ctx)
+    let root = sx_parse_program(ctx)
+    let sema_errs = sx_sema_program(ctx, root)
+    if sema_errs > 0 {
+        print("[Synchronix v3] Compilation aborted with ")
+        print(sema_errs)
+        println(" error(s).")
+        return 1
+    }
+
+    // --- PHASE 2: MIDDLE-END (SUMIR, MEMORY SAFETY, SRAM BUDGET, LOWERING) ---
+    sx_ir_gen_program(ctx, root)
+    sx_middle_end_run(ctx)
+
+    let total_errs = sx_ctx_get(ctx, CTX_ERR_COUNT())
+    if total_errs > 0 {
+        print("[Synchronix v3] Compilation aborted with ")
+        print(total_errs)
+        println(" error(s).")
+        return 1
+    }
+
+    // --- PHASE 3: BACKEND (REGALLOC, SCHEDULING, 6-TARGET CODEGEN) ---
+    sx_pass_regalloc(ctx)
+    sx_pass_inst_schedule(ctx)
+
+    let tgt = sx_ctx_get(ctx, CTX_OPT_TARGET())
+    let emit_asm = sx_ctx_get(ctx, CTX_OPT_EMIT_ASM())
+    let bare_opt = sx_ctx_get(ctx, CTX_OPT_BARE())
+
+    if tgt == TARGET_LLVM_IR() {
+        let ll_path = sx_cstr_alloc(512)
+        sx_cstr_copy(ll_path, out_path)
+        sx_cstr_cat(ll_path, ".ll")
+        let fp_ll = fopen(ll_path, "w")
+        if fp_ll == 0 {
+            print("[Synchronix v3 Error] Cannot open output file: ")
+            sx_println_str(ll_path)
+            sx_cstr_free(ll_path)
+            return 1
+        }
+        sx_codegen_llvm(ctx, fp_ll)
+        fclose(fp_ll)
+        print("[Synchronix v3 Backend] Emitted LLVM IR: ")
+        sx_println_str(ll_path)
+        sx_cstr_free(ll_path)
+        return 0
+    }
+
+    let asm_path = sx_cstr_alloc(512)
+    sx_cstr_copy(asm_path, out_path)
+    sx_cstr_cat(asm_path, ".s")
+
+    let fp = fopen(asm_path, "w")
+    if fp == 0 {
+        print("[Synchronix v3 Error] Cannot open output file: ")
+        sx_println_str(asm_path)
+        sx_cstr_free(asm_path)
+        return 1
+    }
+
+    if tgt == TARGET_CORTEX_M() {
+        sx_codegen_cortex_m(ctx, fp)
+        fclose(fp)
+        if emit_asm != 0 {
+            sx_cstr_free(asm_path)
+            return 0
+        }
+        let cm_rc = sx_assemble_bare_target(ctx, asm_path, out_path, tgt)
+        sx_cstr_free(asm_path)
+        return cm_rc
+    }
+
+    if tgt == TARGET_ARM64_BARE() {
+        sx_codegen_arm64(ctx, fp)
+        fclose(fp)
+        if emit_asm != 0 {
+            sx_cstr_free(asm_path)
+            return 0
+        }
+        let ab_rc = sx_assemble_bare_target(ctx, asm_path, out_path, TARGET_ARM64_BARE())
+        sx_cstr_free(asm_path)
+        return ab_rc
+    }
+
+    if tgt == TARGET_ARM64() {
+        sx_codegen_arm64(ctx, fp)
+        fclose(fp)
+        if emit_asm != 0 {
+            sx_cstr_free(asm_path)
+            return 0
+        }
+        if bare_opt != 0 {
+            let a_brc = sx_assemble_bare_target(ctx, asm_path, out_path, TARGET_ARM64_BARE())
+            sx_cstr_free(asm_path)
+            return a_brc
+        }
+        let a_hrc = sx_assemble_arm64_host(asm_path, out_path)
+        sx_cstr_free(asm_path)
+        return a_hrc
+    }
+
+    if tgt == TARGET_X86_64_BARE() {
+        sx_codegen_x86_64(ctx, fp)
+        fclose(fp)
+        if emit_asm != 0 {
+            sx_cstr_free(asm_path)
+            return 0
+        }
+        let xb_rc = sx_assemble_bare_target(ctx, asm_path, out_path, tgt)
+        sx_cstr_free(asm_path)
+        return xb_rc
+    }
+
+    // Default: Host Native x86_64
+    sx_codegen_x86_64(ctx, fp)
+    fclose(fp)
+
+    if emit_asm != 0 {
+        sx_cstr_free(asm_path)
+        return 0
+    }
+
+    let x_rc = sx_link_x86_64(ctx, asm_path, out_path)
+    sx_cstr_free(asm_path)
+    return x_rc
+}

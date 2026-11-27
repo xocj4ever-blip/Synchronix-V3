@@ -1,0 +1,10 @@
+// SPDX-License-Identifier: Apache-2.0
+// Negative test: Embedded `irq` / `noalloc` checker must reject heap/pool allocs!
+irq noalloc func bad_isr() -> Int {
+    let forbidden = arc(42)
+    return forbidden
+}
+
+func main() -> Int {
+    return bad_isr()
+}

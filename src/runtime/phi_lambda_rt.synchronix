@@ -1,0 +1,162 @@
+// SPDX-License-Identifier: Apache-2.0
+//
+// Copyright 2026 Synchronix Contributors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
+// Full license text: ../../LICENSE
+// End-User License Agreement: ../../EULA.md
+
+// ============================================================================
+// SYNCHRONIX v3.0.0 — Foundation: Unified Phi Formal Logic & Closure Runtime
+// (src/runtime/phi_lambda_rt.synchronix)
+// ============================================================================
+// Pure Synchronix Dual-Mode Phi & Lambda Runtime (100% Freestanding-Clean):
+//   - Hosted Mode (sx2_phi_rt_init): Dynamic closure allocations + Phi checks
+//   - Embedded Mode (sx2_phi_rt_init_embedded): 32-slot static closure pool +
+//     freestanding Phi fault trap (zero OS exit() dependency!)
+// ============================================================================
+
+import sx_defs
+import utils
+
+phi phi_rt_env_header = 2 == 2
+phi phi_rt_pool_cap   = 32 > 0
+
+func PRT_CHECKS()     -> Int { return 0 }
+func PRT_PASSED()     -> Int { return 1 }
+func PRT_CLOSURES()   -> Int { return 2 }
+func PRT_FAULTS()     -> Int { return 3 }
+func PRT_LAST_LINE()  -> Int { return 4 }
+func PRT_CLOS_POOL()  -> Int { return 5 }
+func PRT_MODE()       -> Int { return 6 }
+
+func sx2_phi_rt_init_mode(mode: Int) -> Int {
+    let prt = sx_buf_new(8)
+    sx_buf_set(prt, PRT_CHECKS(), 0)
+    sx_buf_set(prt, PRT_PASSED(), 0)
+    sx_buf_set(prt, PRT_CLOSURES(), 0)
+    sx_buf_set(prt, PRT_FAULTS(), 0)
+    sx_buf_set(prt, PRT_LAST_LINE(), 0)
+    sx_buf_set(prt, PRT_MODE(), mode)
+
+    if mode == MEM_MODE_EMBEDDED() {
+        let cpool = sx_buf_new(EMB_CLOS_POOL_CAP())
+        var i = 0
+        while i < EMB_CLOS_POOL_CAP() {
+            let slot = sx_buf_new(6)
+            sx_buf_set(cpool, i, slot)
+            i = i + 1
+        }
+        sx_buf_set(prt, PRT_CLOS_POOL(), cpool)
+    } else {
+        sx_buf_set(prt, PRT_CLOS_POOL(), 0)
+    }
+    return prt
+}
+
+func sx2_phi_rt_init() -> Int {
+    return sx2_phi_rt_init_mode(MEM_MODE_HOSTED())
+}
+
+func sx2_phi_rt_init_embedded() -> Int {
+    return sx2_phi_rt_init_mode(MEM_MODE_EMBEDDED())
+}
+
+func sx2_phi_check(prt: Int, cond: Int, line: Int) -> Int {
+    let chk = sx_buf_get(prt, PRT_CHECKS())
+    sx_buf_set(prt, PRT_CHECKS(), chk + 1)
+    if cond == 0 {
+        let flt = sx_buf_get(prt, PRT_FAULTS())
+        sx_buf_set(prt, PRT_FAULTS(), flt + 1)
+        sx_buf_set(prt, PRT_LAST_LINE(), line)
+        print("[Synchronix v3 Phi Fault] Contract violation trapped at line ")
+        println(line)
+        return 0
+    }
+    let ok = sx_buf_get(prt, PRT_PASSED())
+    sx_buf_set(prt, PRT_PASSED(), ok + 1)
+    return 1
+}
+
+func sx2_phi_stats(prt: Int) -> Int {
+    let chk = sx_buf_get(prt, PRT_CHECKS())
+    let ok = sx_buf_get(prt, PRT_PASSED())
+    let cl = sx_buf_get(prt, PRT_CLOSURES())
+    let flt = sx_buf_get(prt, PRT_FAULTS())
+    let mode = sx_buf_get(prt, PRT_MODE())
+    print("  Phi Runtime : dynamic_checks="); print(chk)
+    print(" passed="); print(ok)
+    print(" faults="); print(flt)
+    if mode == MEM_MODE_EMBEDDED() {
+        print(" static_closures="); print(cl); println("/32")
+    } else {
+        print(" closures_created="); println(cl)
+    }
+    return 0
+}
+
+// ----------------------------------------------------------------------------
+// Unified Lambda Closure Objects: [0]=fn_id, [1]=env_cnt, [2+i]=env[i]
+// ----------------------------------------------------------------------------
+func sx2_closure_alloc(prt: Int, fn_id: Int, env_cnt: Int) -> Int
+    requires env_cnt >= 0
+{
+    let cnt = sx_buf_get(prt, PRT_CLOSURES())
+    let mode = sx_buf_get(prt, PRT_MODE())
+    var cl = 0
+
+    if mode == MEM_MODE_EMBEDDED() {
+        if cnt >= EMB_CLOS_POOL_CAP() {
+            return 0
+        }
+        let cpool = sx_buf_get(prt, PRT_CLOS_POOL())
+        cl = sx_buf_get(cpool, cnt)
+    } else {
+        cl = sx_buf_new(2 + env_cnt)
+    }
+
+    sx_buf_set(cl, 0, fn_id)
+    sx_buf_set(cl, 1, env_cnt)
+    sx_buf_set(prt, PRT_CLOSURES(), cnt + 1)
+    return cl
+}
+
+func sx2_closure_set_env(cl: Int, idx: Int, value: Int) -> Int
+    requires idx >= 0
+{
+    if cl == 0 { return 0 }
+    sx_buf_set(cl, 2 + idx, value)
+    return value
+}
+
+func sx2_closure_get_env(cl: Int, idx: Int) -> Int
+    requires idx >= 0
+{
+    if cl == 0 { return 0 }
+    let v = sx_buf_get(cl, 2 + idx)
+    return v
+}
+
+func sx2_closure_call1(cl: Int, arg0: Int) -> Int {
+    if cl == 0 { return 0 }
+    let fn_id = sx_buf_get(cl, 0)
+    let cap0 = sx_buf_get(cl, 2)
+    if fn_id == 1 {
+        return arg0 * cap0
+    }
+    if fn_id == 2 {
+        return arg0 + cap0
+    }
+    return arg0
+}

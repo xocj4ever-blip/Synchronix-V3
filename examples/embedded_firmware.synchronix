@@ -1,0 +1,108 @@
+// SPDX-License-Identifier: Apache-2.0
+//
+// Copyright 2026 Synchronix Contributors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
+// Full license text: ../LICENSE
+// End-User License Agreement: ../EULA.md
+
+// ============================================================================
+// SYNCHRONIX EMBEDDED FIRMWARE SHOWCASE (examples/embedded_firmware.synchronix)
+// ============================================================================
+// Demonstrates full Embedded MCU capabilities + V2 Language Parity:
+//   - Hexadecimal MMIO register literals (0x4000_C000, 0x4002_0010, 0x4002_0014)
+//   - Static Phi proof verification of 32-bit MMIO alignment & bounds
+//   - Zero-allocation interrupt service routine (`irq noalloc func`)
+//   - Volatile MMIO reads/writes, critical sections (`irq_disable`/`irq_enable`),
+//     memory barrier (`dmb`), and low-power sleep (`wfi`)
+//   - Static-pool ARC + GC, Lambda closures, and M:N async RTOS tasks
+// Runs natively on Windows via host HAL simulation AND cross-compiles to
+// ARM Cortex-M4 Thumb-2, ARM64 bare-metal, x86_64 bare-metal, and LLVM IR!
+// ============================================================================
+
+phi uart0_dr_aligned = (0x4000_C000 % 4) == 0
+phi gpioa_idr_aligned = (0x4002_0010 % 4) == 0
+phi gpioa_odr_aligned = (0x4002_0014 % 4) == 0
+
+// Zero-allocation hardware interrupt service routine (enforced at compile time!)
+irq noalloc func systick_isr() -> Int {
+    let btn = mmio_read(0x4002_0010)
+    mmio_write(0x4002_0014, btn)
+    dmb()
+    return btn
+}
+
+// Zero-allocation UART byte transmit helper with Phi contract
+noalloc func uart_tx_byte(ch: Int) -> Int
+    requires ch >= 0
+{
+    let status = mmio_read(0x4000_C018)
+    if status == 0 {
+        mmio_write(0x4000_C000, ch)
+    }
+    return ch
+}
+
+// Deterministic Q16.16 fixed-point PID proportional step (zero FPU required)
+noalloc func pid_step_q16(setpoint: Int, measured: Int, kp_q16: Int) -> Int {
+    let err = setpoint - measured
+    return (err * kp_q16) / 65536
+}
+
+async func sensor_task(sample: Int) -> Int {
+    return pid_step_q16(1000, sample, 32768)
+}
+
+func main() -> Int {
+    println("=== SYNCHRONIX EMBEDDED v2.0.0 FIRMWARE EXECUTION ===")
+
+    // 1. Critical section + UART0 MMIO TX ("OK\n")
+    print("1. UART0 MMIO TX    : ")
+    irq_disable()
+    uart_tx_byte(79)
+    uart_tx_byte(75)
+    uart_tx_byte(10)
+    irq_enable()
+
+    // 2. Zero-alloc ISR invocation & GPIO MMIO read/write
+    let gpio_state = systick_isr()
+    print("2. GPIO ISR State   : "); println(gpio_state)
+
+    // 3. Deterministic Q16.16 fixed-point PID control (Kp = 0.5 = 32768)
+    let ctrl = pid_step_q16(1000, 600, 32768)
+    prove (65536 / 2) == 32768
+    print("3. Q16.16 PID Out   : "); println(ctrl)
+
+    // 4. Static-pool ARC + GC + Lambda closure parity
+    let telemetry = arc(ctrl)
+    val snapshot = gc(gpio_state * 100)
+    let gain = 2
+    let amp = lambda (v: Int) => v * gain
+    let out_val = (telemetry + snapshot) |> amp
+    print("4. ARC+GC+Lambda    : "); println(out_val)
+
+    // 5. Cooperative RTOS Async Fibers
+    let f1 = spawn sensor_task(700)
+    let f2 = spawn sensor_task(800)
+    let r1 = await f1
+    let r2 = await f2
+    print("5. RTOS Sensor Sum  : "); println(r1 + r2)
+
+    // 6. Hardware barrier & low-power wait-for-interrupt
+    dmb()
+    wfi()
+    gc_collect()
+    mem_stats()
+    return 0
+}

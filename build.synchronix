@@ -1,0 +1,530 @@
+// SPDX-License-Identifier: Apache-2.0
+//
+// Copyright 2026 Synchronix Contributors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
+// Full license text: LICENSE
+// End-User License Agreement: EULA.md
+
+// ============================================================================
+// SYNCHRONIX v3.0.0 — Pure Synchronix Unified Build & 4-Target Cross-Verifier
+// (build.synchronix)
+// ============================================================================
+// Unified V2 Main + V2 Embedded Pure Synchronix Build System:
+//   - Self-hosted compilation of all 22 pure .synchronix units -> synchronix_v3.exe
+//   - Unified Host + HAL Simulation runtime archive (libsynchronix_v3_host.a)
+//   - 4-Architecture Cross-Verification across ALL 22 units:
+//       1. Hosted ARM64          (aarch64-w64-windows-gnu)
+//       2. ARM Cortex-M4 Thumb-2 (thumbv7em-none-eabi)
+//       3. Bare-Metal ARM64      (aarch64-none-elf)
+//       4. Freestanding x86_64   (x86_64-none-elf)
+//   - Freestanding bare-metal static runtime archives (.a) for each MCU target!
+// ============================================================================
+
+import portable_asm
+
+extern func system(cmd: Int) -> Int;
+extern func fgetc(fp: Int) -> Int;
+extern func fputc(ch: Int, fp: Int) -> Int;
+extern func sx_print_str(s: Int) -> Int;
+extern func sx_println_str(s: Int) -> Int;
+
+phi build_v3_unit_count = (2 + 4 + 4 + 3 + 4 + 4 + 1) == 22
+phi build_v3_xtargets   = (1 + 3) == 4
+
+func ACT_RUNTIME()  -> Int { return 1 }
+func ACT_COMPILER() -> Int { return 2 }
+func ACT_VERIFY()   -> Int { return 4 }
+func ACT_CLEAN()    -> Int { return 8 }
+func ACT_HELP()     -> Int { return 16 }
+
+func BST_CC()       -> Int { return 0 }
+func BST_AR()       -> Int { return 1 }
+func BST_SX()       -> Int { return 2 }
+func BST_CFLAGS()   -> Int { return 3 }
+func BST_LDFLAGS()  -> Int { return 4 }
+func BST_ROOT()     -> Int { return 5 }
+func BST_BLD()      -> Int { return 6 }
+func BST_XVER()     -> Int { return 7 }
+func BST_EXE()      -> Int { return 8 }
+func BST_RT()       -> Int { return 9 }
+func BST_LINK_CMD() -> Int { return 10 }
+
+func bld_get(st: Int, slot: Int) -> Int {
+    return sx_closure_get_env(st, slot)
+}
+
+func bld_set(st: Int, slot: Int, v: Int) -> Int {
+    sx_closure_set_env(st, slot, v)
+    return v
+}
+
+func sx_copy_binary_file(src: Int, dst: Int) -> Int {
+    let fin = fopen(src, "rb")
+    if fin == 0 { return 1 }
+    let fout = fopen(dst, "wb")
+    if fout == 0 { fclose(fin); return 1 }
+    var ch = fgetc(fin)
+    while ch >= 0 && ch < 256 {
+        fputc(ch, fout)
+        ch = fgetc(fin)
+    }
+    fclose(fin)
+    fclose(fout)
+    return 0
+}
+
+func sx_build_help() -> Int {
+    println("SYNCHRONIX v3.0.0 Pure Synchronix Unified Build System (build.synchronix)")
+    println("")
+    println("Usage: sx_build [target]")
+    println("  (default)   Build compiler + host archive + 4-arch cross-verification")
+    println("  all         Build self-hosted compiler (build/synchronix_v3.exe)")
+    println("  build       Alias for 'all'")
+    println("  runtime     Compile all 4 pure .synchronix unified runtime units")
+    println("  compiler    Compile & link build/synchronix_v3.exe from all 22 units")
+    println("  verify      Cross-verify all 22 units for ARM64-host, Cortex-M4, ARM64-bare & x86_64-bare")
+    println("  clean       Remove generated .s, .o, cross_verify/, and build artifacts")
+    println("  --no-verify Skip cross-target verification step")
+    println("  help        Show this message")
+    println("")
+    println("Environment overrides: CC (clang), AR (llvm-ar), SX (build/synchronix.exe), CFLAGS, LDFLAGS")
+    return 0
+}
+
+func sx_probe_root(dir: Int) -> Int {
+    let p = sx_cstr_alloc(1024)
+    sx_cstr_copy(p, dir)
+    sx_cstr_cat(p, "/include/sx_defs.synchronix")
+    let ok = sx_file_exists(p)
+    sx_cstr_free(p)
+    return ok
+}
+
+func sx_strip_component(buf: Int) -> Int {
+    var n = sx_cstr_len(buf)
+    while n > 0 {
+        n = n - 1
+        let ch = sx_ptr_read8(buf + n)
+        if ch == 47 || ch == 92 {
+            sx_ptr_write8(buf + n, 0)
+            return 1
+        }
+    }
+    return 0
+}
+
+func sx_detect_root(st: Int, argv0: Int) -> Int {
+    let root = sx_cstr_alloc(1024)
+    var found = 0
+
+    if sx_probe_root(".") != 0 { sx_cstr_copy(root, "."); found = 1 }
+    if found == 0 && sx_probe_root("..") != 0 { sx_cstr_copy(root, ".."); found = 1 }
+    if found == 0 && argv0 != 0 {
+        sx_cstr_copy(root, argv0)
+        if sx_strip_component(root) != 0 {
+            if sx_probe_root(root) != 0 { found = 1 } else {
+                if sx_strip_component(root) != 0 {
+                    if sx_probe_root(root) != 0 { found = 1 }
+                }
+            }
+        }
+    }
+    if found == 0 { sx_cstr_copy(root, ".") }
+
+    let bld = sx_cstr_alloc(1024)
+    sx_cstr_copy(bld, root); sx_cstr_cat(bld, "/build")
+
+    let xver = sx_cstr_alloc(1024)
+    sx_cstr_copy(xver, root); sx_cstr_cat(xver, "/build/cross_verify")
+
+    let exe = sx_cstr_alloc(1024)
+    sx_cstr_copy(exe, root); sx_cstr_cat(exe, "\\build\\synchronix.exe")
+
+    let rt = sx_cstr_alloc(1024)
+    sx_cstr_copy(rt, root); sx_cstr_cat(rt, "/build/libsynchronix_rt.a")
+
+    bld_set(st, BST_ROOT(), root)
+    bld_set(st, BST_BLD(), bld)
+    bld_set(st, BST_XVER(), xver)
+    bld_set(st, BST_EXE(), exe)
+    bld_set(st, BST_RT(), rt)
+    return 0
+}
+
+func sx_unit_src(idx: Int) -> Int {
+    if idx == 0  { return "include/portable_asm.synchronix" }
+    if idx == 1  { return "include/sx_defs.synchronix" }
+    if idx == 2  { return "src/frontend/utils.synchronix" }
+    if idx == 3  { return "src/frontend/lexer.synchronix" }
+    if idx == 4  { return "src/frontend/parser.synchronix" }
+    if idx == 5  { return "src/frontend/sema.synchronix" }
+    if idx == 6  { return "src/middle/ir_gen.synchronix" }
+    if idx == 7  { return "src/middle/mem_safety.synchronix" }
+    if idx == 8  { return "src/middle/phi_lambda_opt.synchronix" }
+    if idx == 9  { return "src/middle/lowering.synchronix" }
+    if idx == 10 { return "src/backend/target_opt.synchronix" }
+    if idx == 11 { return "src/backend/codegen.synchronix" }
+    if idx == 12 { return "src/backend/emitter.synchronix" }
+    if idx == 13 { return "src/runtime/memory_rt.synchronix" }
+    if idx == 14 { return "src/runtime/async_rt.synchronix" }
+    if idx == 15 { return "src/runtime/phi_lambda_rt.synchronix" }
+    if idx == 16 { return "src/runtime/stdlib.synchronix" }
+    if idx == 17 { return "src/tooling/cargo_pkg.synchronix" }
+    if idx == 18 { return "src/tooling/fmt_lint.synchronix" }
+    if idx == 19 { return "src/tooling/lsp.synchronix" }
+    if idx == 20 { return "src/tooling/debug_prof.synchronix" }
+    if idx == 21 { return "src/main.synchronix" }
+    return 0
+}
+
+func sx_unit_stem(idx: Int) -> Int {
+    if idx == 0  { return "portable_asm" }
+    if idx == 1  { return "sx_defs" }
+    if idx == 2  { return "utils" }
+    if idx == 3  { return "lexer" }
+    if idx == 4  { return "parser" }
+    if idx == 5  { return "sema" }
+    if idx == 6  { return "ir_gen" }
+    if idx == 7  { return "mem_safety" }
+    if idx == 8  { return "phi_lambda_opt" }
+    if idx == 9  { return "lowering" }
+    if idx == 10 { return "target_opt" }
+    if idx == 11 { return "codegen" }
+    if idx == 12 { return "emitter" }
+    if idx == 13 { return "memory_rt" }
+    if idx == 14 { return "async_rt" }
+    if idx == 15 { return "phi_lambda_rt" }
+    if idx == 16 { return "stdlib" }
+    if idx == 17 { return "cargo_pkg" }
+    if idx == 18 { return "fmt_lint" }
+    if idx == 19 { return "lsp" }
+    if idx == 20 { return "debug_prof" }
+    if idx == 21 { return "main" }
+    return 0
+}
+
+func sx_compile_unit(st: Int, idx: Int, append_link: Int) -> Int {
+    let rel = sx_unit_src(idx)
+    let stem = sx_unit_stem(idx)
+    let root = bld_get(st, BST_ROOT())
+    let bld = bld_get(st, BST_BLD())
+    let sx_bin = bld_get(st, BST_SX())
+    let cc_bin = bld_get(st, BST_CC())
+    let cflags = bld_get(st, BST_CFLAGS())
+
+    let src_p = sx_cstr_alloc(1024)
+    sx_cstr_copy(src_p, root); sx_cstr_cat(src_p, "/"); sx_cstr_cat(src_p, rel)
+
+    let out_base = sx_cstr_alloc(1024)
+    sx_cstr_copy(out_base, bld); sx_cstr_cat(out_base, "/"); sx_cstr_cat(out_base, stem)
+
+    let asm_p = sx_cstr_alloc(1024)
+    sx_cstr_copy(asm_p, out_base); sx_cstr_cat(asm_p, ".s")
+
+    let obj_p = sx_cstr_alloc(1024)
+    sx_cstr_copy(obj_p, out_base); sx_cstr_cat(obj_p, ".o")
+
+    let cmd = sx_cstr_alloc(4096)
+    sx_cstr_copy(cmd, sx_bin)
+    sx_cstr_cat(cmd, " compile ")
+    sx_cstr_cat_quoted(cmd, src_p)
+    sx_cstr_cat(cmd, " --emit-asm -o ")
+    sx_cstr_cat_quoted(cmd, out_base)
+    let rc1 = system(cmd)
+
+    if rc1 != 0 {
+        print("ERROR: Failed compiling "); sx_println_str(rel)
+        sx_cstr_free(src_p); sx_cstr_free(out_base); sx_cstr_free(asm_p); sx_cstr_free(obj_p); sx_cstr_free(cmd)
+        return 1
+    }
+
+    sx_cstr_copy(cmd, cc_bin)
+    if sx_cstr_is_empty(cflags) == 0 { sx_cstr_cat(cmd, " "); sx_cstr_cat(cmd, cflags) }
+    sx_cstr_cat(cmd, " -c "); sx_cstr_cat_quoted(cmd, asm_p)
+    sx_cstr_cat(cmd, " -o "); sx_cstr_cat_quoted(cmd, obj_p)
+    let rc2 = system(cmd)
+
+    if rc2 != 0 {
+        print("ERROR: Failed assembling "); sx_println_str(asm_p)
+        sx_cstr_free(src_p); sx_cstr_free(out_base); sx_cstr_free(asm_p); sx_cstr_free(obj_p); sx_cstr_free(cmd)
+        return 1
+    }
+
+    if append_link != 0 {
+        let lcmd = bld_get(st, BST_LINK_CMD())
+        sx_cstr_cat(lcmd, " "); sx_cstr_cat_quoted(lcmd, obj_p)
+    }
+
+    sx_cstr_free(src_p); sx_cstr_free(out_base); sx_cstr_free(asm_p); sx_cstr_free(obj_p); sx_cstr_free(cmd)
+    return 0
+}
+
+func sx_build_v3_host_archive(st: Int) -> Int {
+    let ar_bin = bld_get(st, BST_AR())
+    let bld = bld_get(st, BST_BLD())
+    let base_rt = bld_get(st, BST_RT())
+
+    let host_ar = sx_cstr_alloc(1024)
+    sx_cstr_copy(host_ar, bld); sx_cstr_cat(host_ar, "/libsynchronix_v3_host.a")
+
+    let std_obj = sx_cstr_alloc(1024)
+    sx_cstr_copy(std_obj, bld); sx_cstr_cat(std_obj, "/stdlib.o")
+
+    let v3_std = sx_cstr_alloc(1024)
+    sx_cstr_copy(v3_std, bld); sx_cstr_cat(v3_std, "/v3_stdlib.o")
+
+    let c1 = sx_copy_binary_file(base_rt, host_ar)
+    let c2 = sx_copy_binary_file(std_obj, v3_std)
+    if c1 != 0 || c2 != 0 {
+        sx_cstr_free(host_ar); sx_cstr_free(std_obj); sx_cstr_free(v3_std)
+        return 1
+    }
+
+    let p_defs = sx_cstr_alloc(1024)
+    sx_cstr_copy(p_defs, bld); sx_cstr_cat(p_defs, "/sx_defs.o")
+    let p_port = sx_cstr_alloc(1024)
+    sx_cstr_copy(p_port, bld); sx_cstr_cat(p_port, "/portable_asm.o")
+    let p_util = sx_cstr_alloc(1024)
+    sx_cstr_copy(p_util, bld); sx_cstr_cat(p_util, "/utils.o")
+
+    let cmd = sx_cstr_alloc(4096)
+    sx_cstr_copy(cmd, ar_bin)
+    sx_cstr_cat(cmd, " rcs ")
+    sx_cstr_cat_quoted(cmd, host_ar)
+    sx_cstr_cat(cmd, " "); sx_cstr_cat_quoted(cmd, p_defs)
+    sx_cstr_cat(cmd, " "); sx_cstr_cat_quoted(cmd, p_port)
+    sx_cstr_cat(cmd, " "); sx_cstr_cat_quoted(cmd, p_util)
+    sx_cstr_cat(cmd, " "); sx_cstr_cat_quoted(cmd, v3_std)
+    let rc = system(cmd)
+
+    sx_os_remove(v3_std)
+    sx_cstr_free(host_ar); sx_cstr_free(std_obj); sx_cstr_free(v3_std)
+    sx_cstr_free(p_defs); sx_cstr_free(p_port); sx_cstr_free(p_util); sx_cstr_free(cmd)
+    return rc
+}
+
+func sx_verify_unit_target(st: Int, idx: Int, targ_name: Int, suffix: Int) -> Int {
+    let rel = sx_unit_src(idx)
+    let stem = sx_unit_stem(idx)
+    let root = bld_get(st, BST_ROOT())
+    let xver = bld_get(st, BST_XVER())
+    let sx_bin = bld_get(st, BST_SX())
+
+    let src_p = sx_cstr_alloc(1024)
+    sx_cstr_copy(src_p, root); sx_cstr_cat(src_p, "/"); sx_cstr_cat(src_p, rel)
+
+    let out_base = sx_cstr_alloc(1024)
+    sx_cstr_copy(out_base, xver); sx_cstr_cat(out_base, "/"); sx_cstr_cat(out_base, stem)
+    sx_cstr_cat(out_base, suffix)
+
+    let cmd = sx_cstr_alloc(4096)
+    sx_cstr_copy(cmd, sx_bin)
+    sx_cstr_cat(cmd, " compile ")
+    sx_cstr_cat_quoted(cmd, src_p)
+    sx_cstr_cat(cmd, " --target ")
+    sx_cstr_cat(cmd, targ_name)
+    sx_cstr_cat(cmd, " -o ")
+    sx_cstr_cat_quoted(cmd, out_base)
+
+    let rc = system(cmd)
+    if rc != 0 {
+        print("ERROR: Cross-verify FAILED ("); sx_print_str(targ_name); print(") for ")
+        sx_println_str(rel)
+    }
+    sx_cstr_free(src_p); sx_cstr_free(out_base); sx_cstr_free(cmd)
+    return rc
+}
+
+func sx_archive_bare_rt(st: Int, suffix: Int, archive_name: Int) -> Int {
+    let ar_bin = bld_get(st, BST_AR())
+    let bld = bld_get(st, BST_BLD())
+    let xver = bld_get(st, BST_XVER())
+
+    let cmd = sx_cstr_alloc(4096)
+    sx_cstr_copy(cmd, ar_bin)
+    sx_cstr_cat(cmd, " rcs ")
+    let ar_p = sx_cstr_alloc(1024)
+    sx_cstr_copy(ar_p, bld); sx_cstr_cat(ar_p, "/"); sx_cstr_cat(ar_p, archive_name)
+    sx_cstr_cat_quoted(cmd, ar_p)
+
+    var r = 13
+    while r <= 16 {
+        let stem = sx_unit_stem(r)
+        let obj = sx_cstr_alloc(1024)
+        sx_cstr_copy(obj, xver); sx_cstr_cat(obj, "/"); sx_cstr_cat(obj, stem)
+        sx_cstr_cat(obj, suffix); sx_cstr_cat(obj, ".o")
+        sx_cstr_cat(cmd, " "); sx_cstr_cat_quoted(cmd, obj)
+        sx_cstr_free(obj)
+        r = r + 1
+    }
+    let rc = system(cmd)
+    sx_cstr_free(ar_p)
+    sx_cstr_free(cmd)
+    return rc
+}
+
+func sx_do_clean(st: Int) -> Int {
+    let bld = bld_get(st, BST_BLD())
+    let xver = bld_get(st, BST_XVER())
+    let p = sx_cstr_alloc(1024)
+
+    var i = 0
+    while i < 22 {
+        let stem = sx_unit_stem(i)
+        sx_cstr_copy(p, bld); sx_cstr_cat(p, "/"); sx_cstr_cat(p, stem); sx_cstr_cat(p, ".s"); sx_os_remove(p)
+        sx_cstr_copy(p, bld); sx_cstr_cat(p, "/"); sx_cstr_cat(p, stem); sx_cstr_cat(p, ".o"); sx_os_remove(p)
+        sx_cstr_copy(p, xver); sx_cstr_cat(p, "/"); sx_cstr_cat(p, stem); sx_cstr_cat(p, "_arm64_host.s"); sx_os_remove(p)
+        sx_cstr_copy(p, xver); sx_cstr_cat(p, "/"); sx_cstr_cat(p, stem); sx_cstr_cat(p, "_arm64_host.o"); sx_os_remove(p)
+        sx_cstr_copy(p, xver); sx_cstr_cat(p, "/"); sx_cstr_cat(p, stem); sx_cstr_cat(p, "_cortex_m.s"); sx_os_remove(p)
+        sx_cstr_copy(p, xver); sx_cstr_cat(p, "/"); sx_cstr_cat(p, stem); sx_cstr_cat(p, "_cortex_m.o"); sx_os_remove(p)
+        sx_cstr_copy(p, xver); sx_cstr_cat(p, "/"); sx_cstr_cat(p, stem); sx_cstr_cat(p, "_arm64_bare.s"); sx_os_remove(p)
+        sx_cstr_copy(p, xver); sx_cstr_cat(p, "/"); sx_cstr_cat(p, stem); sx_cstr_cat(p, "_arm64_bare.o"); sx_os_remove(p)
+        sx_cstr_copy(p, xver); sx_cstr_cat(p, "/"); sx_cstr_cat(p, stem); sx_cstr_cat(p, "_x64bare.s"); sx_os_remove(p)
+        sx_cstr_copy(p, xver); sx_cstr_cat(p, "/"); sx_cstr_cat(p, stem); sx_cstr_cat(p, "_x64bare.o"); sx_os_remove(p)
+        i = i + 1
+    }
+    sx_os_rmdir(xver)
+
+    print("[clean] Removed v3 build artifacts from ")
+    sx_println_str(bld)
+    sx_cstr_free(p)
+    return 0
+}
+
+func sx_parse_build_args(argc: Int, argv: Int) -> Int {
+    if argc < 2 {
+        return ACT_RUNTIME() + ACT_COMPILER() + ACT_VERIFY()
+    }
+    var mask = 0
+    var i = 1
+    while i < argc {
+        let a = sx_argv_get(argv, i)
+        if sx_cstr_eq(a, "help") != 0 || sx_cstr_eq(a, "--help") != 0 || sx_cstr_eq(a, "-h") != 0 {
+            mask = mask || ACT_HELP()
+        } else {
+            if sx_cstr_eq(a, "all") != 0 || sx_cstr_eq(a, "build") != 0 || sx_cstr_eq(a, "--no-verify") != 0 {
+                mask = mask || ACT_RUNTIME() || ACT_COMPILER()
+            } else {
+                if sx_cstr_eq(a, "runtime") != 0 {
+                    mask = mask || ACT_RUNTIME()
+                } else {
+                    if sx_cstr_eq(a, "compiler") != 0 {
+                        mask = mask || ACT_COMPILER()
+                    } else {
+                        if sx_cstr_eq(a, "verify") != 0 {
+                            mask = mask || ACT_RUNTIME() || ACT_COMPILER() || ACT_VERIFY()
+                        } else {
+                            if sx_cstr_eq(a, "clean") != 0 {
+                                mask = mask || ACT_CLEAN()
+                            } else {
+                                print("ERROR: Unknown target/option: "); sx_println_str(a)
+                                return -1
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        i = i + 1
+    }
+    return mask
+}
+
+func main(argc: Int, argv: Int) -> Int {
+    let actions = sx_parse_build_args(argc, argv)
+    if actions < 0 { return 1 }
+    if (actions && ACT_HELP()) != 0 { sx_build_help(); return 0 }
+
+    let st = sx_closure_alloc(0, 16)
+    bld_set(st, BST_CC(),      sx_env_or_default("CC", "clang"))
+    bld_set(st, BST_AR(),      sx_env_or_default("AR", "llvm-ar"))
+    bld_set(st, BST_CFLAGS(),  sx_env_or_default("CFLAGS", ""))
+    bld_set(st, BST_LDFLAGS(), sx_env_or_default("LDFLAGS", "-fuse-ld=lld"))
+
+    var argv0 = 0
+    if argc >= 1 { argv0 = sx_argv_get(argv, 0) }
+    sx_detect_root(st, argv0)
+    bld_set(st, BST_SX(), sx_env_or_default("SX", bld_get(st, BST_EXE())))
+
+    if (actions && ACT_CLEAN()) != 0 { sx_do_clean(st) }
+    if (actions && (ACT_RUNTIME() || ACT_COMPILER() || ACT_VERIFY())) == 0 { return 0 }
+
+    let bld_dir = bld_get(st, BST_BLD())
+    sx_os_mkdir(bld_dir)
+
+    let lcmd = sx_cstr_alloc(16384)
+    sx_cstr_copy(lcmd, bld_get(st, BST_CC()))
+    let ldf = bld_get(st, BST_LDFLAGS())
+    if sx_cstr_is_empty(ldf) == 0 { sx_cstr_cat(lcmd, " "); sx_cstr_cat(lcmd, ldf) }
+    bld_set(st, BST_LINK_CMD(), lcmd)
+
+    if (actions && ACT_RUNTIME()) != 0 {
+        println("[1/4] Compiling Synchronix v3 Unified Runtime Units (Pure .synchronix)...")
+        var r = 13
+        while r <= 16 {
+            if sx_compile_unit(st, r, 0) != 0 { return 1 }
+            r = r + 1
+        }
+    }
+
+    if (actions && ACT_COMPILER()) != 0 {
+        println("[2/4] Compiling Synchronix v3 Compiler & Tooling (22 Pure .synchronix Units)...")
+        var c = 0
+        while c < 22 {
+            if sx_compile_unit(st, c, 1) != 0 { return 1 }
+            c = c + 1
+        }
+
+        println("[3/4] Linking build/synchronix_v3.exe & archiving libsynchronix_v3_host.a...")
+        let out_stage = sx_cstr_alloc(1024)
+        sx_cstr_copy(out_stage, bld_dir); sx_cstr_cat(out_stage, "/synchronix_v3.exe")
+
+        sx_cstr_cat(lcmd, " "); sx_cstr_cat_quoted(lcmd, bld_get(st, BST_RT()))
+        sx_cstr_cat(lcmd, " -o "); sx_cstr_cat_quoted(lcmd, out_stage)
+
+        if system(lcmd) != 0 {
+            println("ERROR: Failed linking synchronix_v3.exe")
+            return 1
+        }
+        if sx_build_v3_host_archive(st) != 0 {
+            println("ERROR: Failed archiving libsynchronix_v3_host.a")
+            return 1
+        }
+        print("SUCCESS! Built self-hosted v3 compiler: "); sx_println_str(out_stage)
+        sx_cstr_free(out_stage)
+    }
+
+    if (actions && ACT_VERIFY()) != 0 {
+        println("[4/4] Cross-Verifying all 22 pure .synchronix units across 4 Hosted & Bare-Metal Targets...")
+        let xver_dir = bld_get(st, BST_XVER())
+        sx_os_mkdir(xver_dir)
+
+        var v = 0
+        while v < 22 {
+            if sx_verify_unit_target(st, v, "arm64", "_arm64_host") != 0 { return 1 }
+            if sx_verify_unit_target(st, v, "cortex-m", "_cortex_m") != 0 { return 1 }
+            if sx_verify_unit_target(st, v, "arm64-bare", "_arm64_bare") != 0 { return 1 }
+            if sx_verify_unit_target(st, v, "x86_64-bare", "_x64bare") != 0 { return 1 }
+            v = v + 1
+        }
+
+        sx_archive_bare_rt(st, "_cortex_m",   "libsynchronix_v3_rt_cortex_m.a")
+        sx_archive_bare_rt(st, "_arm64_bare", "libsynchronix_v3_rt_arm64_bare.a")
+        sx_archive_bare_rt(st, "_x64bare",    "libsynchronix_v3_rt_x86_64_bare.a")
+        println("  [OK] All 22 units compiled & assembled cleanly for Hosted ARM64 (aarch64-w64-windows-gnu), Cortex-M4 (thumbv7em-none-eabi), ARM64-bare (aarch64-none-elf), and x86_64-bare (x86_64-none-elf)!")
+    }
+
+    return 0
+}

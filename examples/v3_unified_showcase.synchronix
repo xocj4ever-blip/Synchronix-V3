@@ -1,0 +1,104 @@
+// SPDX-License-Identifier: Apache-2.0
+//
+// Copyright 2026 Synchronix Contributors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
+// Full license text: ../LICENSE
+// End-User License Agreement: ../EULA.md
+
+// ============================================================================
+// SYNCHRONIX v3.0.0 UNIFIED SHOWCASE (examples/v3_unified_showcase.synchronix)
+// ============================================================================
+// Exercises BOTH Hosted V2 Main AND Bare-Metal V2 Embedded Parity in ONE file:
+//   - Generics <T>, Swift-style ARC, Kotlin-style Tracing GC, Borrow Checker
+//   - Lambda closures w/ environment capture + pipe operator (|>)
+//   - Phi compile-time axioms (including hex MMIO alignment) & runtime contracts
+//   - Zero-allocation hardware ISR (`irq noalloc func`), volatile MMIO,
+//     critical sections (`irq_disable`/`irq_enable`), `dmb()`, and `wfi()`
+//   - Q16.16 fixed-point PID DSP math & M:N / RTOS async fibers
+// ============================================================================
+
+phi v3_math_axiom     = (6 * 7) == 42
+phi v3_uart_aligned   = (0x4000_C000 % 4) == 0
+phi v3_gpio_aligned   = (0x4002_0014 % 4) == 0
+
+func identity<T>(x: T) -> T {
+    return x
+}
+
+func safe_div(a: Int, b: Int) -> Int
+    requires b != 0
+{
+    prove a >= 0
+    return a / b
+}
+
+irq noalloc func systick_isr() -> Int {
+    let pin = mmio_read(0x4002_0010)
+    mmio_write(0x4002_0014, pin)
+    dmb()
+    return pin
+}
+
+noalloc func pid_q16(setpoint: Int, measured: Int, kp_q16: Int) -> Int {
+    return ((setpoint - measured) * kp_q16) / 65536
+}
+
+async func telemetry_worker(sample: Int) -> Int {
+    return pid_q16(1000, sample, 32768)
+}
+
+func main() -> Int {
+    println("=== SYNCHRONIX v3.0.0 UNIFIED HOSTED + EMBEDDED SHOWCASE ===")
+
+    // 1. Hosted + Embedded Unified ARC, GC & Borrow
+    let a = arc(42)
+    let a_alias = a
+    val g = gc(100)
+    let owned = 77
+    let ref = borrow owned
+    print("1. ARC+GC+Borrow    : "); println(a_alias + g + ref)
+
+    // 2. Generics + Phi Formal Contract + Lambda Pipe
+    let id_v = identity<Int>(21)
+    let div_v = safe_div(84, 2)
+    let scale = 2
+    let amp = lambda (x: Int) => x * scale
+    let piped = id_v |> amp
+    prove 21 * 2 == 42
+    print("2. Gen+Phi+Lambda   : "); println(div_v + piped)
+
+    // 3. Hardware Critical Section + UART0 MMIO + Zero-Alloc ISR
+    print("3. UART0 MMIO TX    : ")
+    irq_disable()
+    mmio_write(0x4000_C000, 86)
+    mmio_write(0x4000_C000, 51)
+    mmio_write(0x4000_C000, 10)
+    irq_enable()
+    let isr_pin = systick_isr()
+    print("4. ISR GPIO Pin     : "); println(isr_pin)
+
+    // 4. Deterministic Q16.16 PID + Cooperative M:N / RTOS Fibers
+    let t1 = spawn telemetry_worker(600)
+    let t2 = spawn telemetry_worker(800)
+    let r1 = await t1
+    let r2 = await t2
+    print("5. Async Q16 PID    : "); println(r1 + r2)
+
+    dmb()
+    wfi()
+    gc_collect()
+    mem_stats()
+    return 0
+}

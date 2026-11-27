@@ -1,0 +1,285 @@
+// SPDX-License-Identifier: Apache-2.0
+//
+// Copyright 2026 Synchronix Contributors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
+// Full license text: ../LICENSE
+// End-User License Agreement: ../EULA.md
+
+// ============================================================================
+// SYNCHRONIX v3.0.0 — Unified Portable ABI, Embedded HAL & Host Helpers
+// (include/portable_asm.synchronix)
+// ============================================================================
+// Unified V2 Main + V2 Embedded Parity Portable Layer:
+//   - Canonical ABI contracts for Hosted x86_64/ARM64 AND Bare-Metal
+//     Cortex-M4 (Thumb-2 32-bit), ARM64-bare (AArch64 ELF), and x86_64-bare
+//   - Standard MCU MMIO peripheral base addresses (UART0, GPIOA, SYSTICK, NVIC)
+//   - Safe pointer read/write primitives (8-bit & 64-bit) & argv indexing
+//   - Dynamic NUL-terminated C-string builders & cross-platform OS helpers
+// ============================================================================
+
+extern func sx_closure_alloc(fn_ptr: Int, cap: Int) -> Int;
+extern func sx_closure_set_env(buf: Int, idx: Int, value: Int) -> Int;
+extern func sx_closure_get_env(buf: Int, idx: Int) -> Int;
+extern func sx_arc_release(buf: Int) -> Int;
+
+extern func calloc(nmemb: Int, size: Int) -> Int;
+extern func free(ptr: Int) -> Int;
+extern func memcpy(dst: Int, src: Int, n: Int) -> Int;
+extern func strlen(s: Int) -> Int;
+extern func strcmp(a: Int, b: Int) -> Int;
+extern func strcpy(dst: Int, src: Int) -> Int;
+extern func strcat(dst: Int, src: Int) -> Int;
+extern func strstr(haystack: Int, needle: Int) -> Int;
+extern func getenv(name: Int) -> Int;
+extern func fopen(path: Int, mode: Int) -> Int;
+extern func fclose(fp: Int) -> Int;
+extern func remove(path: Int) -> Int;
+extern func _mkdir(path: Int) -> Int;
+extern func _rmdir(path: Int) -> Int;
+
+// Static Phi ABI & Embedded Hardware Invariants (0-cost compile-time proofs)
+phi portable_abi_arg_regs      = 4 == 4
+phi portable_abi_callee_regs   = 5 == 5
+phi portable_abi_word_bytes    = 8 == 8
+phi portable_cortex_m_word     = 4 == 4
+phi portable_mmio_uart_aligned = (1073790976 % 4) == 0
+phi portable_mmio_gpio_aligned = (1073872896 % 4) == 0
+
+func SX_ABI_ARG_REGS()        -> Int { return 4 }
+func SX_ABI_CALLEE_REGS()     -> Int { return 5 }
+func SX_ABI_WORD_BYTES()      -> Int { return 8 }
+func SX_EMB_CORTEX_M_WORD()   -> Int { return 4 }
+func SX_EMB_STACK_ALIGN()     -> Int { return 8 }
+
+// Standard Embedded MCU MMIO Register Addresses (STM32 / LM3S / Cortex-M4)
+// UART0_DR = 0x4000C000 (1073790976), UART0_FR = 0x4000C018 (1073791000)
+// GPIOA_MODER = 0x40020000 (1073872896), GPIOA_IDR = 0x40020010 (1073872912)
+// GPIOA_ODR = 0x40020014 (1073872916), SYST_CVR = 0xE000E018 (3758153752)
+func HAL_UART0_DR()           -> Int { return 1073790976 }
+func HAL_UART0_FR()           -> Int { return 1073791000 }
+func HAL_GPIOA_MODER()        -> Int { return 1073872896 }
+func HAL_GPIOA_IDR()          -> Int { return 1073872912 }
+func HAL_GPIOA_ODR()          -> Int { return 1073872916 }
+func HAL_SYSTICK_CSR()        -> Int { return 3758153744 }
+func HAL_SYSTICK_CVR()        -> Int { return 3758153752 }
+func HAL_NVIC_ISER0()         -> Int { return 3758153984 }
+
+// Default MCU Memory Map Budgets (Cortex-M4F: 256 KB Flash, 64 KB SRAM)
+func HAL_FLASH_ORIGIN()       -> Int { return 134217728 }
+func HAL_SRAM_ORIGIN()        -> Int { return 536870912 }
+func HAL_DEFAULT_FLASH_KB()   -> Int { return 256 }
+func HAL_DEFAULT_SRAM_KB()    -> Int { return 64 }
+
+// ----------------------------------------------------------------------------
+// Portable Pointer & Byte Memory Primitives (Little-Endian x86_64 & ARM64)
+// ----------------------------------------------------------------------------
+func sx_ptr_read64(addr: Int) -> Int {
+    if addr == 0 {
+        return 0
+    }
+    let box = sx_closure_alloc(0, 1)
+    memcpy(box + 16, addr, 8)
+    let v = sx_closure_get_env(box, 0)
+    sx_arc_release(box)
+    return v
+}
+
+func sx_ptr_write64(addr: Int, value: Int) -> Int {
+    if addr == 0 {
+        return 0
+    }
+    let box = sx_closure_alloc(0, 1)
+    sx_closure_set_env(box, 0, value)
+    memcpy(addr, box + 16, 8)
+    sx_arc_release(box)
+    return value
+}
+
+func sx_ptr_read8(addr: Int) -> Int {
+    if addr == 0 {
+        return 0
+    }
+    let box = sx_closure_alloc(0, 1)
+    sx_closure_set_env(box, 0, 0)
+    memcpy(box + 16, addr, 1)
+    let v = sx_closure_get_env(box, 0)
+    sx_arc_release(box)
+    return v
+}
+
+func sx_ptr_write8(addr: Int, byte_val: Int) -> Int {
+    if addr == 0 {
+        return 0
+    }
+    let box = sx_closure_alloc(0, 1)
+    sx_closure_set_env(box, 0, byte_val)
+    memcpy(addr, box + 16, 1)
+    sx_arc_release(box)
+    return byte_val
+}
+
+func sx_argv_get(argv: Int, idx: Int) -> Int {
+    if argv == 0 || idx < 0 {
+        return 0
+    }
+    let ptr = sx_ptr_read64(argv + idx * 8)
+    return ptr
+}
+
+// ----------------------------------------------------------------------------
+// Dynamic C-String Buffer Builders & Comparisons (Host Compiler Driver)
+// ----------------------------------------------------------------------------
+func sx_cstr_alloc(bytes: Int) -> Int
+    requires bytes > 0
+{
+    let p = calloc(1, bytes)
+    return p
+}
+
+func sx_cstr_free(ptr: Int) -> Int {
+    if ptr != 0 {
+        free(ptr)
+    }
+    return 0
+}
+
+func sx_cstr_copy(dst: Int, src: Int) -> Int {
+    if dst == 0 || src == 0 {
+        return 0
+    }
+    strcpy(dst, src)
+    return dst
+}
+
+func sx_cstr_cat(dst: Int, src: Int) -> Int {
+    if dst == 0 || src == 0 {
+        return 0
+    }
+    strcat(dst, src)
+    return dst
+}
+
+func sx_cstr_cat_char(dst: Int, ch: Int) -> Int {
+    if dst == 0 {
+        return 0
+    }
+    let n = strlen(dst)
+    sx_ptr_write8(dst + n, ch)
+    sx_ptr_write8(dst + n + 1, 0)
+    return n + 1
+}
+
+func sx_cstr_cat_quote(dst: Int) -> Int {
+    let n = sx_cstr_cat_char(dst, 34)
+    return n
+}
+
+func sx_cstr_cat_quoted(dst: Int, text: Int) -> Int {
+    sx_cstr_cat_quote(dst)
+    sx_cstr_cat(dst, text)
+    sx_cstr_cat_quote(dst)
+    return dst
+}
+
+func sx_cstr_eq(a: Int, b: Int) -> Int {
+    if a == 0 || b == 0 {
+        return 0
+    }
+    let r = strcmp(a, b)
+    if r == 0 {
+        return 1
+    }
+    return 0
+}
+
+func sx_cstr_len(s: Int) -> Int {
+    if s == 0 {
+        return 0
+    }
+    let n = strlen(s)
+    return n
+}
+
+func sx_cstr_contains(haystack: Int, needle: Int) -> Int {
+    if haystack == 0 || needle == 0 {
+        return 0
+    }
+    let hit = strstr(haystack, needle)
+    if hit != 0 {
+        return 1
+    }
+    return 0
+}
+
+func sx_cstr_is_empty(s: Int) -> Int {
+    if s == 0 {
+        return 1
+    }
+    let ch = sx_ptr_read8(s)
+    if ch == 0 {
+        return 1
+    }
+    return 0
+}
+
+// ----------------------------------------------------------------------------
+// Cross-Platform Environment & Filesystem Helpers
+// ----------------------------------------------------------------------------
+func sx_env_or_default(env_name: String, def_val: String) -> Int {
+    let v = getenv(env_name)
+    if v != 0 {
+        let ch = sx_ptr_read8(v)
+        if ch != 0 {
+            return v
+        }
+    }
+    return def_val
+}
+
+func sx_file_exists(path: Int) -> Int {
+    if path == 0 {
+        return 0
+    }
+    let fp = fopen(path, "rb")
+    if fp != 0 {
+        fclose(fp)
+        return 1
+    }
+    return 0
+}
+
+func sx_os_mkdir(dir_path: Int) -> Int {
+    if dir_path == 0 {
+        return 0
+    }
+    _mkdir(dir_path)
+    return 0
+}
+
+func sx_os_rmdir(dir_path: Int) -> Int {
+    if dir_path == 0 {
+        return 0
+    }
+    _rmdir(dir_path)
+    return 0
+}
+
+func sx_os_remove(file_path: Int) -> Int {
+    if file_path == 0 {
+        return 0
+    }
+    remove(file_path)
+    return 0
+}

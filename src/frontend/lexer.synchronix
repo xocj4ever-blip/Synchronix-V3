@@ -1,0 +1,468 @@
+// SPDX-License-Identifier: Apache-2.0
+//
+// Copyright 2026 Synchronix Contributors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
+// Full license text: ../../LICENSE
+// End-User License Agreement: ../../EULA.md
+
+// ============================================================================
+// SYNCHRONIX v3.0.0 — Phase 1: Unified Lexer / Tokenizer
+// (src/frontend/lexer.synchronix)
+// ============================================================================
+// Full V2-parity Pure Synchronix Lexer extended for Embedded Bare-Metal:
+//   - All V2 keywords (Swift + Kotlin + Phi + Lambda + v2 extensions)
+//   - Embedded hardware & safety keywords: irq, noalloc, bare, volatile,
+//     static, mmio_read, mmio_write, irq_disable, irq_enable, wfi, dmb
+//   - Hexadecimal (0x... / 0X...) & decimal integer literals w/ '_' separators
+//   - Accurate line & column tracking (including newlines inside /* ... */)
+// ============================================================================
+
+import sx_defs
+import portable_asm
+import utils
+
+phi lex_ascii_digit_span = (57 - 48) == 9
+phi lex_ascii_alpha_span = (122 - 97) == 25
+phi lex_hex_radix_valid  = 16 == 16
+
+// ----------------------------------------------------------------------------
+// Character Classification Helpers (ASCII + Hexadecimal)
+// ----------------------------------------------------------------------------
+func sx_is_alpha(ch: Int) -> Int {
+    if ch == 95 {
+        return 1
+    }
+    if ch >= 97 && ch <= 122 {
+        return 1
+    }
+    if ch >= 65 && ch <= 90 {
+        return 1
+    }
+    return 0
+}
+
+func sx_is_digit(ch: Int) -> Int {
+    if ch >= 48 && ch <= 57 {
+        return 1
+    }
+    return 0
+}
+
+func sx_hex_val(ch: Int) -> Int {
+    if ch >= 48 && ch <= 57  { return ch - 48 }
+    if ch >= 97 && ch <= 102 { return 10 + (ch - 97) }
+    if ch >= 65 && ch <= 70  { return 10 + (ch - 65) }
+    return -1
+}
+
+func sx_is_alnum(ch: Int) -> Int {
+    let a = sx_is_alpha(ch)
+    if a != 0 {
+        return 1
+    }
+    let d = sx_is_digit(ch)
+    return d
+}
+
+// ----------------------------------------------------------------------------
+// Token Emission Helpers
+// ----------------------------------------------------------------------------
+func sx_emit_tok(ctx: Int, kind: Int, start: Int, len: Int) -> Int {
+    let idx = sx_ctx_get(ctx, CTX_TOK_COUNT())
+    let lim = MAX_TOKENS()
+    if idx >= lim {
+        return -1
+    }
+    sx_ctx_set(ctx, CTX_TOK_COUNT(), idx + 1)
+    sx_tok_set(ctx, idx, TOK_KIND(), kind)
+    sx_tok_set(ctx, idx, TOK_START(), start)
+    sx_tok_set(ctx, idx, TOK_LEN(), len)
+    sx_tok_set(ctx, idx, TOK_IVAL(), 0)
+    sx_tok_set(ctx, idx, TOK_LINE(), 1)
+    sx_tok_set(ctx, idx, TOK_COL(), 1)
+    return idx
+}
+
+func sx_emit_tok_meta(ctx: Int, idx: Int, ival: Int, line: Int) -> Int {
+    if idx < 0 {
+        return 0
+    }
+    sx_tok_set(ctx, idx, TOK_IVAL(), ival)
+    sx_tok_set(ctx, idx, TOK_LINE(), line)
+    return idx
+}
+
+func sx_emit_tok_col(ctx: Int, idx: Int, col: Int) -> Int {
+    if idx < 0 {
+        return 0
+    }
+    sx_tok_set(ctx, idx, TOK_COL(), col)
+    return idx
+}
+
+// ----------------------------------------------------------------------------
+// Exact Full-String Keyword Classifier (V2 Parity + Embedded Hardware Kws)
+// ----------------------------------------------------------------------------
+func sx_classify_kw_a(ctx: Int, s: Int, len: Int) -> Int {
+    if sx_slice_eq_cstr(ctx, s, len, "func")      != 0 { return TK_KW_FUNC() }
+    if sx_slice_eq_cstr(ctx, s, len, "fun")       != 0 { return TK_KW_FUNC() }
+    if sx_slice_eq_cstr(ctx, s, len, "let")       != 0 { return TK_KW_LET() }
+    if sx_slice_eq_cstr(ctx, s, len, "val")       != 0 { return TK_KW_LET() }
+    if sx_slice_eq_cstr(ctx, s, len, "var")       != 0 { return TK_KW_VAR() }
+    if sx_slice_eq_cstr(ctx, s, len, "return")    != 0 { return TK_KW_RETURN() }
+    if sx_slice_eq_cstr(ctx, s, len, "if")        != 0 { return TK_KW_IF() }
+    if sx_slice_eq_cstr(ctx, s, len, "else")      != 0 { return TK_KW_ELSE() }
+    if sx_slice_eq_cstr(ctx, s, len, "while")     != 0 { return TK_KW_WHILE() }
+    if sx_slice_eq_cstr(ctx, s, len, "true")      != 0 { return TK_KW_TRUE() }
+    if sx_slice_eq_cstr(ctx, s, len, "false")     != 0 { return TK_KW_FALSE() }
+    if sx_slice_eq_cstr(ctx, s, len, "arc")       != 0 { return TK_KW_ARC() }
+    if sx_slice_eq_cstr(ctx, s, len, "gc")        != 0 { return TK_KW_GC() }
+    if sx_slice_eq_cstr(ctx, s, len, "borrow")    != 0 { return TK_KW_BORROW() }
+    if sx_slice_eq_cstr(ctx, s, len, "move")      != 0 { return TK_KW_MOVE() }
+    return TK_IDENT()
+}
+
+func sx_classify_kw_b(ctx: Int, s: Int, len: Int) -> Int {
+    if sx_slice_eq_cstr(ctx, s, len, "phi")       != 0 { return TK_KW_PHI() }
+    if sx_slice_eq_cstr(ctx, s, len, "requires")  != 0 { return TK_KW_REQUIRES() }
+    if sx_slice_eq_cstr(ctx, s, len, "ensures")   != 0 { return TK_KW_ENSURES() }
+    if sx_slice_eq_cstr(ctx, s, len, "invariant") != 0 { return TK_KW_INVARIANT() }
+    if sx_slice_eq_cstr(ctx, s, len, "prove")     != 0 { return TK_KW_PROVE() }
+    if sx_slice_eq_cstr(ctx, s, len, "lambda")    != 0 { return TK_KW_LAMBDA() }
+    if sx_slice_eq_cstr(ctx, s, len, "async")     != 0 { return TK_KW_ASYNC() }
+    if sx_slice_eq_cstr(ctx, s, len, "spawn")     != 0 { return TK_KW_SPAWN() }
+    if sx_slice_eq_cstr(ctx, s, len, "await")     != 0 { return TK_KW_AWAIT() }
+    if sx_slice_eq_cstr(ctx, s, len, "struct")    != 0 { return TK_KW_STRUCT() }
+    if sx_slice_eq_cstr(ctx, s, len, "extern")    != 0 { return TK_KW_EXTERN() }
+    if sx_slice_eq_cstr(ctx, s, len, "import")    != 0 { return TK_KW_IMPORT() }
+    if sx_slice_eq_cstr(ctx, s, len, "match")     != 0 { return TK_KW_MATCH() }
+    if sx_slice_eq_cstr(ctx, s, len, "enum")      != 0 { return TK_KW_ENUM() }
+    if sx_slice_eq_cstr(ctx, s, len, "trait")     != 0 { return TK_KW_TRAIT() }
+    if sx_slice_eq_cstr(ctx, s, len, "impl")      != 0 { return TK_KW_IMPL() }
+    if sx_slice_eq_cstr(ctx, s, len, "const")     != 0 { return TK_KW_CONST() }
+    return TK_IDENT()
+}
+
+func sx_classify_kw_emb(ctx: Int, s: Int, len: Int) -> Int {
+    if sx_slice_eq_cstr(ctx, s, len, "irq")         != 0 { return TK_KW_IRQ() }
+    if sx_slice_eq_cstr(ctx, s, len, "noalloc")     != 0 { return TK_KW_NOALLOC() }
+    if sx_slice_eq_cstr(ctx, s, len, "bare")        != 0 { return TK_KW_BARE() }
+    if sx_slice_eq_cstr(ctx, s, len, "volatile")    != 0 { return TK_KW_VOLATILE() }
+    if sx_slice_eq_cstr(ctx, s, len, "static")      != 0 { return TK_KW_STATIC() }
+    if sx_slice_eq_cstr(ctx, s, len, "mmio_read")   != 0 { return TK_KW_MMIO_READ() }
+    if sx_slice_eq_cstr(ctx, s, len, "mmio_write")  != 0 { return TK_KW_MMIO_WRITE() }
+    if sx_slice_eq_cstr(ctx, s, len, "irq_disable") != 0 { return TK_KW_IRQ_DISABLE() }
+    if sx_slice_eq_cstr(ctx, s, len, "irq_enable")  != 0 { return TK_KW_IRQ_ENABLE() }
+    if sx_slice_eq_cstr(ctx, s, len, "wfi")         != 0 { return TK_KW_WFI() }
+    if sx_slice_eq_cstr(ctx, s, len, "dmb")         != 0 { return TK_KW_DMB() }
+    return TK_IDENT()
+}
+
+func sx_classify_kw(ctx: Int, start: Int, len: Int) -> Int {
+    if len < 2 || len > 12 {
+        return TK_IDENT()
+    }
+    let ka = sx_classify_kw_a(ctx, start, len)
+    if ka != TK_IDENT() {
+        return ka
+    }
+    let kb = sx_classify_kw_b(ctx, start, len)
+    if kb != TK_IDENT() {
+        return kb
+    }
+    let ke = sx_classify_kw_emb(ctx, start, len)
+    return ke
+}
+
+// ----------------------------------------------------------------------------
+// Operator & Punctuation Classifiers
+// ----------------------------------------------------------------------------
+func sx_lex_op2(ch: Int, nxt: Int) -> Int {
+    if ch == 61 && nxt == 61 { return TK_EQ() }
+    if ch == 61 && nxt == 62 { return TK_FATARROW() }
+    if ch == 33 && nxt == 61 { return TK_NE() }
+    if ch == 60 && nxt == 61 { return TK_LE() }
+    if ch == 62 && nxt == 61 { return TK_GE() }
+    if ch == 45 && nxt == 62 { return TK_ARROW() }
+    if ch == 38 && nxt == 38 { return TK_AND() }
+    if ch == 124 && nxt == 124 { return TK_OR() }
+    if ch == 124 && nxt == 62 { return TK_PIPE() }
+    if ch == 58 && nxt == 58 { return TK_DCOLON() }
+    return -1
+}
+
+func sx_lex_op1(ch: Int) -> Int {
+    if ch == 40  { return TK_LPAREN() }
+    if ch == 41  { return TK_RPAREN() }
+    if ch == 123 { return TK_LBRACE() }
+    if ch == 125 { return TK_RBRACE() }
+    if ch == 91  { return TK_LBRACKET() }
+    if ch == 93  { return TK_RBRACKET() }
+    if ch == 44  { return TK_COMMA() }
+    if ch == 58  { return TK_COLON() }
+    if ch == 59  { return TK_SEMI() }
+    if ch == 46  { return TK_DOT() }
+    if ch == 43  { return TK_PLUS() }
+    if ch == 45  { return TK_MINUS() }
+    if ch == 42  { return TK_STAR() }
+    if ch == 47  { return TK_SLASH() }
+    if ch == 37  { return TK_PERCENT() }
+    if ch == 61  { return TK_ASSIGN() }
+    if ch == 60  { return TK_LT() }
+    if ch == 62  { return TK_GT() }
+    if ch == 33  { return TK_BANG() }
+    if ch == 38  { return TK_AMP() }
+    return -1
+}
+
+// ----------------------------------------------------------------------------
+// Sub-Scanners for Comments, Identifiers, Decimal/Hex Numbers, and Strings
+// ----------------------------------------------------------------------------
+func sx_lex_skip_line_comment(ctx: Int, pos: Int, slen: Int) -> Int {
+    var p = pos + 2
+    while p < slen {
+        let ch = sx_src_char(ctx, p)
+        if ch == 10 {
+            return p
+        }
+        p = p + 1
+    }
+    return p
+}
+
+func sx_lex_skip_block_comment(ctx: Int, pos: Int, slen: Int, st_box: Int) -> Int {
+    var p = pos + 2
+    var line = sx_buf_get(st_box, 0)
+    var col = sx_buf_get(st_box, 1) + 2
+    while p < slen {
+        let ch = sx_src_char(ctx, p)
+        if ch == 10 {
+            line = line + 1
+            col = 1
+        }
+        let nxt = sx_src_char(ctx, p + 1)
+        if ch == 42 && nxt == 47 {
+            sx_buf_set(st_box, 0, line)
+            sx_buf_set(st_box, 1, col + 2)
+            return p + 2
+        }
+        p = p + 1
+        col = col + 1
+    }
+    sx_buf_set(st_box, 0, line)
+    sx_buf_set(st_box, 1, col)
+    return p
+}
+
+func sx_lex_ident(ctx: Int, start: Int, slen: Int, st_box: Int) -> Int {
+    let line = sx_buf_get(st_box, 0)
+    let col = sx_buf_get(st_box, 1)
+    var p = start + 1
+    var keep = 1
+    while p < slen && keep == 1 {
+        let ch = sx_src_char(ctx, p)
+        let ok = sx_is_alnum(ch)
+        if ok != 0 {
+            p = p + 1
+        } else {
+            keep = 0
+        }
+    }
+    let tlen = p - start
+    let kind = sx_classify_kw(ctx, start, tlen)
+    let idx = sx_emit_tok(ctx, kind, start, tlen)
+    sx_emit_tok_meta(ctx, idx, 0, line)
+    sx_emit_tok_col(ctx, idx, col)
+    sx_buf_set(st_box, 1, col + tlen)
+    return p
+}
+
+func sx_lex_number(ctx: Int, start: Int, slen: Int, st_box: Int) -> Int {
+    let line = sx_buf_get(st_box, 0)
+    let col = sx_buf_get(st_box, 1)
+    var p = start
+    var acc = 0
+
+    // Support Embedded Hexadecimal Literals (0x4002_0000 / 0XFF)
+    let c0 = sx_src_char(ctx, start)
+    let c1 = sx_src_char(ctx, start + 1)
+    if c0 == 48 && (c1 == 120 || c1 == 88) {
+        p = start + 2
+        var hkeep = 1
+        while p < slen && hkeep == 1 {
+            let hch = sx_src_char(ctx, p)
+            if hch == 95 {
+                p = p + 1
+            } else {
+                let hv = sx_hex_val(hch)
+                if hv >= 0 {
+                    acc = acc * 16 + hv
+                    p = p + 1
+                } else {
+                    hkeep = 0
+                }
+            }
+        }
+    } else {
+        var keep = 1
+        while p < slen && keep == 1 {
+            let ch = sx_src_char(ctx, p)
+            if ch == 95 {
+                p = p + 1
+            } else {
+                let ok = sx_is_digit(ch)
+                if ok != 0 {
+                    acc = acc * 10 + (ch - 48)
+                    p = p + 1
+                } else {
+                    keep = 0
+                }
+            }
+        }
+    }
+
+    let tlen = p - start
+    let idx = sx_emit_tok(ctx, TK_INT(), start, tlen)
+    sx_emit_tok_meta(ctx, idx, acc, line)
+    sx_emit_tok_col(ctx, idx, col)
+    sx_buf_set(st_box, 1, col + tlen)
+    return p
+}
+
+func sx_lex_string(ctx: Int, start: Int, slen: Int, st_box: Int) -> Int {
+    let line = sx_buf_get(st_box, 0)
+    let col = sx_buf_get(st_box, 1)
+    let content_start = start + 1
+    var p = content_start
+    var keep = 1
+    while p < slen && keep == 1 {
+        let ch = sx_src_char(ctx, p)
+        if ch == 34 {
+            keep = 0
+        } else {
+            p = p + 1
+        }
+    }
+    let tlen = p - content_start
+    let idx = sx_emit_tok(ctx, TK_STR(), content_start, tlen)
+    sx_emit_tok_meta(ctx, idx, 0, line)
+    sx_emit_tok_col(ctx, idx, col)
+    if p < slen {
+        sx_buf_set(st_box, 1, col + tlen + 2)
+        return p + 1
+    }
+    sx_buf_set(st_box, 1, col + tlen + 1)
+    return p
+}
+
+// ----------------------------------------------------------------------------
+// Main Lexer Entry Point: sx_lex(ctx) -> token_count
+// ----------------------------------------------------------------------------
+func sx_lex(ctx: Int) -> Int {
+    sx_ctx_set(ctx, CTX_TOK_COUNT(), 0)
+    sx_ctx_set(ctx, CTX_TOK_POS(), 0)
+    let slen = sx_ctx_get(ctx, CTX_SRC_LEN())
+    let st_box = sx_buf_new(2)
+    sx_buf_set(st_box, 0, 1)
+    sx_buf_set(st_box, 1, 1)
+    var pos = 0
+
+    while pos < slen {
+        let ch = sx_src_char(ctx, pos)
+        var handled = 0
+
+        if ch == 32 || ch == 9 || ch == 13 {
+            pos = pos + 1
+            let c1 = sx_buf_get(st_box, 1)
+            sx_buf_set(st_box, 1, c1 + 1)
+            handled = 1
+        }
+        if handled == 0 && ch == 10 {
+            pos = pos + 1
+            let ln1 = sx_buf_get(st_box, 0)
+            sx_buf_set(st_box, 0, ln1 + 1)
+            sx_buf_set(st_box, 1, 1)
+            handled = 1
+        }
+
+        if handled == 0 && ch == 47 {
+            let nxt_c = sx_src_char(ctx, pos + 1)
+            if nxt_c == 47 {
+                pos = sx_lex_skip_line_comment(ctx, pos, slen)
+                handled = 1
+            } else {
+                if nxt_c == 42 {
+                    pos = sx_lex_skip_block_comment(ctx, pos, slen, st_box)
+                    handled = 1
+                }
+            }
+        }
+
+        if handled == 0 {
+            let isa = sx_is_alpha(ch)
+            if isa != 0 {
+                pos = sx_lex_ident(ctx, pos, slen, st_box)
+                handled = 1
+            }
+        }
+
+        if handled == 0 {
+            let isd = sx_is_digit(ch)
+            if isd != 0 {
+                pos = sx_lex_number(ctx, pos, slen, st_box)
+                handled = 1
+            }
+        }
+
+        if handled == 0 && ch == 34 {
+            pos = sx_lex_string(ctx, pos, slen, st_box)
+            handled = 1
+        }
+
+        if handled == 0 {
+            let cur_ln = sx_buf_get(st_box, 0)
+            let cur_col = sx_buf_get(st_box, 1)
+            let nxt_o = sx_src_char(ctx, pos + 1)
+            let op2 = sx_lex_op2(ch, nxt_o)
+            if op2 >= 0 {
+                let idx2 = sx_emit_tok(ctx, op2, pos, 2)
+                sx_emit_tok_meta(ctx, idx2, 0, cur_ln)
+                sx_emit_tok_col(ctx, idx2, cur_col)
+                sx_buf_set(st_box, 1, cur_col + 2)
+                pos = pos + 2
+                handled = 1
+            } else {
+                let op1 = sx_lex_op1(ch)
+                if op1 >= 0 {
+                    let idx1 = sx_emit_tok(ctx, op1, pos, 1)
+                    sx_emit_tok_meta(ctx, idx1, 0, cur_ln)
+                    sx_emit_tok_col(ctx, idx1, cur_col)
+                }
+                sx_buf_set(st_box, 1, cur_col + 1)
+                pos = pos + 1
+            }
+        }
+    }
+
+    let eof_ln = sx_buf_get(st_box, 0)
+    let eof_col = sx_buf_get(st_box, 1)
+    let eof_idx = sx_emit_tok(ctx, TK_EOF(), slen, 0)
+    sx_emit_tok_meta(ctx, eof_idx, 0, eof_ln)
+    sx_emit_tok_col(ctx, eof_idx, eof_col)
+    sx_buf_free(st_box)
+
+    let total = sx_ctx_get(ctx, CTX_TOK_COUNT())
+    return total
+}

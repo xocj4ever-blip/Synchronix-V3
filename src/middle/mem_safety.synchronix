@@ -1,0 +1,271 @@
+// SPDX-License-Identifier: Apache-2.0
+//
+// Copyright 2026 Synchronix Contributors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
+// Full license text: ../../LICENSE
+// End-User License Agreement: ../../EULA.md
+
+// ============================================================================
+// SYNCHRONIX v3.0.0 — Phase 2: Unified Memory Safety & Static SRAM Budgeter
+// (src/middle/mem_safety.synchronix)
+// ============================================================================
+// Bidirectional SUMIR <-> Static Analysis & Embedded Memory Safety:
+//   1. Ownership & Borrow Checker (detects use-after-move on moved vregs)
+//   2. Lifetime Analyzer (computes [def_idx, last_use_idx] per virtual reg)
+//   3. Deterministic ARC Retain/Release Insertion (static-pool backed)
+//   4. Bounded GC Shadow Root Insertion & Scope Unrooting
+//   5. Static Embedded SRAM Budget Estimator (checks stack + static pools
+//      against target SRAM budget --sram-kb)
+// ============================================================================
+
+import sx_defs
+import utils
+
+phi mem_safety_max_tracked = 128 > 0
+phi mem_safety_pool_sram   = (3072 + 3072 + 4096) == 10240
+
+func sx_copy_ir_to_scratch(ctx: Int, src_idx: Int, dst_idx: Int) -> Int {
+    let ibuf = sx_ctx_get(ctx, CTX_IR_BUF())
+    let sbuf = sx_ctx_get(ctx, CTX_IR_SCRATCH())
+    let sb = src_idx * IR_STRIDE()
+    let db = dst_idx * IR_STRIDE()
+    var k = 0
+    while k < IR_STRIDE() {
+        let v = sx_buf_get(ibuf, sb + k)
+        sx_buf_set(sbuf, db + k, v)
+        k = k + 1
+    }
+    return 0
+}
+
+func sx_emit_scratch_mem(ctx: Int, dst_idx: Int, op: Int, src1: Int) -> Int {
+    let sbuf = sx_ctx_get(ctx, CTX_IR_SCRATCH())
+    let db = dst_idx * IR_STRIDE()
+    sx_buf_set(sbuf, db + IR_OP(), op)
+    sx_buf_set(sbuf, db + IR_DST(), 0)
+    sx_buf_set(sbuf, db + IR_SRC1(), src1)
+    sx_buf_set(sbuf, db + IR_SRC2(), 0)
+    sx_buf_set(sbuf, db + IR_IMM(), 0)
+    sx_buf_set(sbuf, db + IR_TYPE(), 0)
+    sx_buf_set(sbuf, db + IR_FLAGS(), 0)
+    sx_buf_set(sbuf, db + IR_PHYS(), -1)
+    return 0
+}
+
+func sx_op_has_src1_vreg(op: Int) -> Int {
+    if op == IR_CONST()       { return 0 }
+    if op == IR_STR_CONST()   { return 0 }
+    if op == IR_CALL()        { return 0 }
+    if op == IR_FUNC_BEGIN()  { return 0 }
+    if op == IR_FUNC_END()    { return 0 }
+    if op == IR_LABEL()       { return 0 }
+    if op == IR_JMP()         { return 0 }
+    if op == IR_CLOSURE_NEW() { return 0 }
+    if op == IR_SPAWN()       { return 0 }
+    if op == IR_IRQ_DISABLE() { return 0 }
+    if op == IR_IRQ_ENABLE()  { return 0 }
+    if op == IR_WFI()         { return 0 }
+    if op == IR_DMB()         { return 0 }
+    return 1
+}
+
+// ----------------------------------------------------------------------------
+// Pass A: Ownership / Use-After-Move Checker & Lifetime Analyzer
+// ----------------------------------------------------------------------------
+func sx_pass_ownership_lifetime(ctx: Int) -> Int {
+    let mv = MAX_VREGS()
+    let vdef = sx_ctx_get(ctx, CTX_VREG_DEF())
+    let vuse = sx_ctx_get(ctx, CTX_VREG_LAST_USE())
+    let vmov = sx_ctx_get(ctx, CTX_VREG_MOVED())
+    sx_buf_zero(vdef, mv)
+    sx_buf_zero(vuse, mv)
+    sx_buf_zero(vmov, mv)
+
+    let cnt = sx_ctx_get(ctx, CTX_IR_COUNT())
+    var i = 0
+    while i < cnt {
+        let op = sx_ir_get(ctx, i, IR_OP())
+        if op == IR_FUNC_BEGIN() {
+            sx_buf_zero(vmov, mv)
+        } else {
+            let has1 = sx_op_has_src1_vreg(op)
+            if has1 != 0 {
+                let s1 = sx_ir_get(ctx, i, IR_SRC1())
+                if s1 > 0 && s1 < mv {
+                    let is_moved = sx_buf_get(vmov, s1)
+                    if is_moved != 0 {
+                        sx_error(ctx, 0, "Ownership Checker Error: use of moved value")
+                    }
+                    sx_buf_set(vuse, s1, i)
+                }
+            }
+            if op == IR_SPAWN() {
+                let sp_arg = sx_ir_get(ctx, i, IR_IMM())
+                if sp_arg > 0 && sp_arg < mv {
+                    sx_buf_set(vuse, sp_arg, i)
+                }
+            }
+            if (op >= IR_ADD() && op <= IR_OR()) || op == IR_CLOSURE_CALL() || op == IR_MMIO_WRITE() {
+                let s2 = sx_ir_get(ctx, i, IR_SRC2())
+                if s2 > 0 && s2 < mv {
+                    sx_buf_set(vuse, s2, i)
+                }
+            }
+            if op == IR_MOVE() {
+                let ms = sx_ir_get(ctx, i, IR_SRC1())
+                if ms > 0 && ms < mv {
+                    sx_buf_set(vmov, ms, 1)
+                }
+            }
+            let dst = sx_ir_get(ctx, i, IR_DST())
+            if dst > 0 && dst < mv {
+                sx_buf_set(vdef, dst, i)
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// ----------------------------------------------------------------------------
+// Pass B: ARC Retain/Release Insertion & GC Shadow Root Insertion
+// ----------------------------------------------------------------------------
+func sx_pass_arc_gc_insert(ctx: Int) -> Int {
+    let cnt = sx_ctx_get(ctx, CTX_IR_COUNT())
+    let arc_list = sx_buf_new(128)
+    let gc_list = sx_buf_new(128)
+    var arc_cnt = 0
+    var gc_cnt = 0
+    var w = 0
+    var i = 0
+
+    while i < cnt {
+        let op = sx_ir_get(ctx, i, IR_OP())
+        if op == IR_FUNC_BEGIN() {
+            arc_cnt = 0
+            gc_cnt = 0
+        }
+
+        if op == IR_RET() {
+            var a = 0
+            while a < arc_cnt {
+                let av = sx_buf_get(arc_list, a)
+                sx_emit_scratch_mem(ctx, w, IR_ARC_RELEASE(), av)
+                w = w + 1
+                sx_ctx_inc(ctx, CTX_STAT_ARC_INS())
+                a = a + 1
+            }
+            var g = 0
+            while g < gc_cnt {
+                let gv = sx_buf_get(gc_list, g)
+                sx_emit_scratch_mem(ctx, w, IR_GC_UNROOT(), gv)
+                w = w + 1
+                sx_ctx_inc(ctx, CTX_STAT_GC_ROOTS())
+                g = g + 1
+            }
+        }
+
+        sx_copy_ir_to_scratch(ctx, i, w)
+        w = w + 1
+
+        let dst = sx_ir_get(ctx, i, IR_DST())
+        if op == IR_ARC_NEW() || op == IR_CLOSURE_NEW() {
+            if arc_cnt < 128 {
+                sx_buf_set(arc_list, arc_cnt, dst)
+                arc_cnt = arc_cnt + 1
+            }
+        }
+        if op == IR_MOV() {
+            let fl = sx_ir_get(ctx, i, IR_FLAGS())
+            let is_arc_alias = fl && IRF_ARC()
+            if is_arc_alias != 0 {
+                sx_emit_scratch_mem(ctx, w, IR_ARC_RETAIN(), dst)
+                w = w + 1
+                sx_ctx_inc(ctx, CTX_STAT_ARC_INS())
+                if arc_cnt < 128 {
+                    sx_buf_set(arc_list, arc_cnt, dst)
+                    arc_cnt = arc_cnt + 1
+                }
+            }
+        }
+        if op == IR_GC_NEW() {
+            sx_emit_scratch_mem(ctx, w, IR_GC_ROOT(), dst)
+            w = w + 1
+            sx_ctx_inc(ctx, CTX_STAT_GC_ROOTS())
+            if gc_cnt < 128 {
+                sx_buf_set(gc_list, gc_cnt, dst)
+                gc_cnt = gc_cnt + 1
+            }
+        }
+        i = i + 1
+    }
+
+    let ibuf = sx_ctx_get(ctx, CTX_IR_BUF())
+    let sbuf = sx_ctx_get(ctx, CTX_IR_SCRATCH())
+    let total_slots = w * IR_STRIDE()
+    var k = 0
+    while k < total_slots {
+        let sv = sx_buf_get(sbuf, k)
+        sx_buf_set(ibuf, k, sv)
+        k = k + 1
+    }
+    sx_ctx_set(ctx, CTX_IR_COUNT(), w)
+    sx_buf_free(arc_list)
+    sx_buf_free(gc_list)
+    return w
+}
+
+// ----------------------------------------------------------------------------
+// Pass C: Static Embedded SRAM Footprint Estimator & Budget Check
+// ----------------------------------------------------------------------------
+func sx_pass_sram_budget(ctx: Int) -> Int {
+    let fns = sx_ctx_get(ctx, CTX_IR_FUNC_CNT())
+    let arcs = sx_ctx_get(ctx, CTX_STAT_ARC_INS())
+    let gcs = sx_ctx_get(ctx, CTX_STAT_GC_ROOTS())
+    let tgt = sx_ctx_get(ctx, CTX_OPT_TARGET())
+
+    // Stack estimate: 512 B/frame on Cortex-M4 (32-bit), 1024 B on 64-bit bare
+    var frame_sz = 1024
+    if tgt == TARGET_CORTEX_M() {
+        frame_sz = 512
+    }
+    var est = frame_sz
+    if fns > 1 {
+        est = est + (fns - 1) * 128
+    }
+    if arcs > 0 {
+        est = est + EMB_ARC_POOL_CAP() * 48
+    }
+    if gcs > 0 {
+        est = est + EMB_GC_POOL_CAP() * 48 + EMB_MAX_GC_ROOTS() * 8
+    }
+    sx_ctx_set(ctx, CTX_STAT_SRAM_EST(), est)
+
+    let budget_kb = sx_ctx_get(ctx, CTX_OPT_SRAM_KB())
+    if budget_kb > 0 {
+        let budget_bytes = budget_kb * 1024
+        if est > budget_bytes {
+            sx_warn(ctx, 0, "Embedded SRAM Budget Warning: estimated static SRAM exceeds target --sram-kb limit")
+        }
+    }
+    return est
+}
+
+func sx_pass_mem_safety(ctx: Int) -> Int {
+    sx_pass_ownership_lifetime(ctx)
+    let new_cnt = sx_pass_arc_gc_insert(ctx)
+    sx_pass_sram_budget(ctx)
+    return new_cnt
+}

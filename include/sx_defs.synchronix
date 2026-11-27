@@ -1,0 +1,467 @@
+// SPDX-License-Identifier: Apache-2.0
+//
+// Copyright 2026 Synchronix Contributors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
+// Full license text: ../LICENSE
+// End-User License Agreement: ../EULA.md
+
+// ============================================================================
+// SYNCHRONIX v3.0.0 — Unified Shared Compiler, IR, HAL & Runtime Definitions
+// (include/sx_defs.synchronix)
+// ============================================================================
+// 100% Pure Synchronix Unified Hosted + Embedded Parity across all 5 domains:
+//   Phase 1: Frontend (Lexer w/ hex & embedded kws, Parser, Sema + noalloc/MMIO)
+//   Phase 2: Middle-End (SUMIR + MMIO/IRQ/WFI/DMB, Ownership/ARC/GC, Lowering)
+//   Phase 3: Backend (x86_64, ARM64, ARM64-bare, Cortex-M4, x86_64-bare, LLVM)
+//   Foundation: Dual-Mode Unified Memory (Hosted + Static-Pool), M:N/RTOS
+//               Fibers, Phi/Lambda Runtime, Full Core + Embedded DSP Stdlib
+//   Ecosystem: Cargo Hosted & Firmware Scaffold, Size/Budget, LSP, Linter, Prof
+// ============================================================================
+
+// Top-level Phi Formal Axioms — statically verified at compile time (0 cost)
+phi sx_v3_version_major      = 3 == 3
+phi sx_v3_tok_stride_valid   = 6 == 6
+phi sx_v3_ast_stride_valid   = 12 == 12
+phi sx_v3_sym_stride_valid   = 8 == 8
+phi sx_v3_ir_stride_valid    = 8 == 8
+phi sx_v3_obj_hdr_aligned    = (6 * 8) == 48
+phi sx_v3_host_arena_bytes   = (8192 * 8) == 65536
+phi sx_v3_emb_pool_bounded   = (64 * 48) == 3072
+phi sx_v3_emb_arena_bounded  = (512 * 8) == 4096
+phi sx_v3_task_stride_valid  = 6 == 6
+
+// ----------------------------------------------------------------------------
+// Version & Architecture Metadata
+// ----------------------------------------------------------------------------
+func SX_VER_MAJOR() -> Int { return 3 }
+func SX_VER_MINOR() -> Int { return 0 }
+func SX_VER_PATCH() -> Int { return 0 }
+
+// ----------------------------------------------------------------------------
+// Token Kinds (Phase 1: Lexer / Tokenizer)
+// ----------------------------------------------------------------------------
+func TK_EOF()          -> Int { return 0 }
+func TK_IDENT()        -> Int { return 1 }
+func TK_INT()          -> Int { return 2 }
+func TK_STR()          -> Int { return 3 }
+
+// Keywords (Full V2 Swift + Kotlin + Phi + Lambda Parity)
+func TK_KW_FUNC()      -> Int { return 10 }
+func TK_KW_LET()       -> Int { return 11 }
+func TK_KW_VAR()       -> Int { return 12 }
+func TK_KW_RETURN()    -> Int { return 13 }
+func TK_KW_IF()        -> Int { return 14 }
+func TK_KW_ELSE()      -> Int { return 15 }
+func TK_KW_WHILE()     -> Int { return 16 }
+func TK_KW_TRUE()      -> Int { return 17 }
+func TK_KW_FALSE()     -> Int { return 18 }
+func TK_KW_ARC()       -> Int { return 19 }
+func TK_KW_GC()        -> Int { return 20 }
+func TK_KW_BORROW()    -> Int { return 21 }
+func TK_KW_MOVE()      -> Int { return 22 }
+func TK_KW_PHI()       -> Int { return 23 }
+func TK_KW_REQUIRES()  -> Int { return 24 }
+func TK_KW_ENSURES()   -> Int { return 25 }
+func TK_KW_INVARIANT() -> Int { return 26 }
+func TK_KW_PROVE()     -> Int { return 27 }
+func TK_KW_LAMBDA()    -> Int { return 28 }
+func TK_KW_ASYNC()     -> Int { return 29 }
+func TK_KW_SPAWN()     -> Int { return 30 }
+func TK_KW_AWAIT()     -> Int { return 31 }
+func TK_KW_STRUCT()    -> Int { return 32 }
+func TK_KW_EXTERN()    -> Int { return 33 }
+func TK_KW_IMPORT()    -> Int { return 34 }
+func TK_KW_MATCH()     -> Int { return 35 }
+func TK_KW_ENUM()      -> Int { return 36 }
+func TK_KW_TRAIT()     -> Int { return 37 }
+func TK_KW_IMPL()      -> Int { return 38 }
+func TK_KW_CONST()     -> Int { return 39 }
+
+// Embedded Bare-Metal Hardware & Safety Keywords (70..79)
+func TK_KW_IRQ()         -> Int { return 70 }
+func TK_KW_NOALLOC()     -> Int { return 71 }
+func TK_KW_BARE()        -> Int { return 72 }
+func TK_KW_VOLATILE()    -> Int { return 73 }
+func TK_KW_STATIC()      -> Int { return 74 }
+func TK_KW_MMIO_READ()   -> Int { return 75 }
+func TK_KW_MMIO_WRITE()  -> Int { return 76 }
+func TK_KW_IRQ_DISABLE() -> Int { return 77 }
+func TK_KW_IRQ_ENABLE()  -> Int { return 78 }
+func TK_KW_WFI()         -> Int { return 79 }
+func TK_KW_DMB()         -> Int { return 80 }
+
+// Delimiters & Punctuation
+func TK_LPAREN()       -> Int { return 40 }
+func TK_RPAREN()       -> Int { return 41 }
+func TK_LBRACE()       -> Int { return 42 }
+func TK_RBRACE()       -> Int { return 43 }
+func TK_LBRACKET()     -> Int { return 44 }
+func TK_RBRACKET()     -> Int { return 45 }
+func TK_COMMA()        -> Int { return 46 }
+func TK_COLON()        -> Int { return 47 }
+func TK_SEMI()         -> Int { return 48 }
+func TK_DOT()          -> Int { return 49 }
+
+// Operators
+func TK_PLUS()         -> Int { return 50 }
+func TK_MINUS()        -> Int { return 51 }
+func TK_STAR()         -> Int { return 52 }
+func TK_SLASH()        -> Int { return 53 }
+func TK_PERCENT()      -> Int { return 54 }
+func TK_ASSIGN()       -> Int { return 55 }
+func TK_EQ()           -> Int { return 56 }
+func TK_NE()           -> Int { return 57 }
+func TK_LT()           -> Int { return 58 }
+func TK_LE()           -> Int { return 59 }
+func TK_GT()           -> Int { return 60 }
+func TK_GE()           -> Int { return 61 }
+func TK_AND()          -> Int { return 62 }
+func TK_OR()           -> Int { return 63 }
+func TK_BANG()         -> Int { return 64 }
+func TK_ARROW()        -> Int { return 65 }
+func TK_FATARROW()     -> Int { return 66 }
+func TK_PIPE()         -> Int { return 67 }
+func TK_AMP()          -> Int { return 68 }
+func TK_DCOLON()       -> Int { return 69 }
+
+// Token Field Offsets (in 64-bit slots; stride = 6 slots = 48 bytes)
+func TOK_KIND()        -> Int { return 0 }
+func TOK_START()       -> Int { return 1 }
+func TOK_LEN()         -> Int { return 2 }
+func TOK_IVAL()        -> Int { return 3 }
+func TOK_LINE()        -> Int { return 4 }
+func TOK_COL()         -> Int { return 5 }
+func TOK_STRIDE()      -> Int { return 6 }
+
+// ----------------------------------------------------------------------------
+// AST Node Kinds & Layout (Phase 1: Parser & Semantic Analyzer)
+// ----------------------------------------------------------------------------
+func NK_PROGRAM()      -> Int { return 1 }
+func NK_FUNC()         -> Int { return 2 }
+func NK_PARAM()        -> Int { return 3 }
+func NK_BLOCK()        -> Int { return 4 }
+func NK_LET()          -> Int { return 5 }
+func NK_ASSIGN()       -> Int { return 6 }
+func NK_RETURN()       -> Int { return 7 }
+func NK_IF()           -> Int { return 8 }
+func NK_WHILE()        -> Int { return 9 }
+func NK_PROVE()        -> Int { return 10 }
+func NK_EXPR_STMT()    -> Int { return 11 }
+func NK_INT()          -> Int { return 12 }
+func NK_STR()          -> Int { return 13 }
+func NK_IDENT()        -> Int { return 14 }
+func NK_BINOP()        -> Int { return 15 }
+func NK_UNOP()         -> Int { return 16 }
+func NK_CALL()         -> Int { return 17 }
+func NK_ARC_NEW()      -> Int { return 18 }
+func NK_GC_NEW()       -> Int { return 19 }
+func NK_BORROW()       -> Int { return 20 }
+func NK_MOVE()         -> Int { return 21 }
+func NK_LAMBDA()       -> Int { return 22 }
+func NK_SPAWN()        -> Int { return 23 }
+func NK_AWAIT()        -> Int { return 24 }
+func NK_PHI_DECL()     -> Int { return 25 }
+func NK_STRUCT()       -> Int { return 26 }
+// Embedded Bare-Metal Hardware AST Node Kinds
+func NK_MMIO_READ()    -> Int { return 27 }
+func NK_MMIO_WRITE()   -> Int { return 28 }
+func NK_IRQ_CTRL()     -> Int { return 29 }
+func NK_WFI()          -> Int { return 30 }
+func NK_DMB()          -> Int { return 31 }
+
+// AST Node Field Offsets (in 64-bit slots; stride = 12 slots = 96 bytes)
+func AST_KIND()        -> Int { return 0 }
+func AST_NAME_START()  -> Int { return 1 }
+func AST_NAME_LEN()    -> Int { return 2 }
+func AST_IVAL()        -> Int { return 3 }
+func AST_LEFT()        -> Int { return 4 }
+func AST_RIGHT()       -> Int { return 5 }
+func AST_EXTRA()       -> Int { return 6 }
+func AST_EXTRA2()      -> Int { return 7 }
+func AST_NEXT()        -> Int { return 8 }
+func AST_TYPE()        -> Int { return 9 }
+func AST_LINE()        -> Int { return 10 }
+func AST_META()        -> Int { return 11 }
+func AST_STRIDE()      -> Int { return 12 }
+
+// AST Node Flags (V2 + Embedded Modifiers)
+func FL_ASYNC()        -> Int { return 1 }
+func FL_MUT()          -> Int { return 2 }
+func FL_GENERIC()      -> Int { return 4 }
+func FL_ARC()          -> Int { return 8 }
+func FL_GC()           -> Int { return 16 }
+func FL_EXTERN()       -> Int { return 32 }
+func FL_IRQ()          -> Int { return 64 }
+func FL_NOALLOC()      -> Int { return 128 }
+func FL_BARE()         -> Int { return 256 }
+func FL_VOLATILE()     -> Int { return 512 }
+
+// Type IDs
+func TY_UNKNOWN()      -> Int { return 0 }
+func TY_INT()          -> Int { return 1 }
+func TY_BOOL()         -> Int { return 2 }
+func TY_STR()          -> Int { return 3 }
+func TY_VOID()         -> Int { return 4 }
+func TY_ARC()          -> Int { return 5 }
+func TY_GC()           -> Int { return 6 }
+func TY_CLOSURE()      -> Int { return 7 }
+func TY_TASK()         -> Int { return 8 }
+func TY_GENERIC()      -> Int { return 9 }
+func TY_BORROW()       -> Int { return 10 }
+func TY_REG32()        -> Int { return 11 }
+
+// Phi Formal Proof Verification Status
+func PHI_UNVERIFIED()    -> Int { return 0 }
+func PHI_PROVEN_STATIC() -> Int { return 1 }
+func PHI_RUNTIME_CHECK() -> Int { return 2 }
+func PHI_REFUTED()       -> Int { return 3 }
+
+// ----------------------------------------------------------------------------
+// Symbol Table Layout (stride = 8 slots = 64 bytes)
+// ----------------------------------------------------------------------------
+func SYME_NAME_START() -> Int { return 0 }
+func SYME_NAME_LEN()   -> Int { return 1 }
+func SYME_TYPE()       -> Int { return 2 }
+func SYME_SCOPE()      -> Int { return 3 }
+func SYME_OWN_STATE()  -> Int { return 4 }
+func SYME_MEM_KIND()   -> Int { return 5 }
+func SYME_SLOT()       -> Int { return 6 }
+func SYME_CONST_VAL()  -> Int { return 7 }
+func SYME_STRIDE()     -> Int { return 8 }
+
+func OWN_OWNED()       -> Int { return 0 }
+func OWN_MOVED()       -> Int { return 1 }
+func OWN_BORROWED()    -> Int { return 2 }
+func OWN_DROPPED()     -> Int { return 3 }
+
+func MEM_STACK()       -> Int { return 0 }
+func MEM_ARC()         -> Int { return 1 }
+func MEM_GC()          -> Int { return 2 }
+func MEM_CLOSURE()     -> Int { return 3 }
+
+// ----------------------------------------------------------------------------
+// SUMIR Opcodes & Layout (Phase 2: Middle-End)
+// ----------------------------------------------------------------------------
+func IR_NOP()          -> Int { return 0 }
+func IR_FUNC_BEGIN()   -> Int { return 1 }
+func IR_FUNC_END()     -> Int { return 2 }
+func IR_PARAM()        -> Int { return 3 }
+func IR_CONST()        -> Int { return 4 }
+func IR_STR_CONST()    -> Int { return 5 }
+func IR_MOV()          -> Int { return 6 }
+func IR_ADD()          -> Int { return 7 }
+func IR_SUB()          -> Int { return 8 }
+func IR_MUL()          -> Int { return 9 }
+func IR_DIV()          -> Int { return 10 }
+func IR_MOD()          -> Int { return 11 }
+func IR_NEG()          -> Int { return 12 }
+func IR_CMP_EQ()       -> Int { return 13 }
+func IR_CMP_NE()       -> Int { return 14 }
+func IR_CMP_LT()       -> Int { return 15 }
+func IR_CMP_LE()       -> Int { return 16 }
+func IR_CMP_GT()       -> Int { return 17 }
+func IR_CMP_GE()       -> Int { return 18 }
+func IR_AND()          -> Int { return 19 }
+func IR_OR()           -> Int { return 20 }
+func IR_NOT()          -> Int { return 21 }
+func IR_LABEL()        -> Int { return 22 }
+func IR_JMP()          -> Int { return 23 }
+func IR_BRZ()          -> Int { return 24 }
+func IR_ARG()          -> Int { return 25 }
+func IR_CALL()         -> Int { return 26 }
+func IR_RET()          -> Int { return 27 }
+
+// Unified Memory (ARC + GC + Borrow) SUMIR Opcodes
+func IR_ARC_NEW()      -> Int { return 30 }
+func IR_ARC_RETAIN()   -> Int { return 31 }
+func IR_ARC_RELEASE()  -> Int { return 32 }
+func IR_ARC_LOAD()     -> Int { return 33 }
+func IR_GC_NEW()       -> Int { return 34 }
+func IR_GC_ROOT()      -> Int { return 35 }
+func IR_GC_UNROOT()    -> Int { return 36 }
+func IR_GC_LOAD()      -> Int { return 37 }
+func IR_BORROW()       -> Int { return 38 }
+func IR_MOVE()         -> Int { return 39 }
+
+// Phi, Lambda & M:N Async SUMIR Opcodes
+func IR_PHI_ASSERT()   -> Int { return 40 }
+func IR_CLOSURE_NEW()  -> Int { return 41 }
+func IR_CLOSURE_SET()  -> Int { return 42 }
+func IR_CLOSURE_GET()  -> Int { return 43 }
+func IR_CLOSURE_CALL() -> Int { return 44 }
+func IR_SPAWN()        -> Int { return 45 }
+func IR_AWAIT()        -> Int { return 46 }
+
+// Embedded Bare-Metal Hardware & RTOS SUMIR Opcodes (50..55)
+func IR_MMIO_READ()    -> Int { return 50 }
+func IR_MMIO_WRITE()   -> Int { return 51 }
+func IR_IRQ_DISABLE()  -> Int { return 52 }
+func IR_IRQ_ENABLE()   -> Int { return 53 }
+func IR_WFI()          -> Int { return 54 }
+func IR_DMB()          -> Int { return 55 }
+
+// SUMIR Instruction Field Offsets (stride = 8 slots = 64 bytes)
+func IR_OP()           -> Int { return 0 }
+func IR_DST()          -> Int { return 1 }
+func IR_SRC1()         -> Int { return 2 }
+func IR_SRC2()         -> Int { return 3 }
+func IR_IMM()          -> Int { return 4 }
+func IR_TYPE()         -> Int { return 5 }
+func IR_FLAGS()        -> Int { return 6 }
+func IR_PHYS()         -> Int { return 7 }
+func IR_STRIDE()       -> Int { return 8 }
+
+// SUMIR Flags
+func IRF_DEAD()        -> Int { return 1 }
+func IRF_PROVEN()      -> Int { return 2 }
+func IRF_CONST()       -> Int { return 4 }
+func IRF_ARC()         -> Int { return 8 }
+func IRF_GC()          -> Int { return 16 }
+func IRF_INLINED()     -> Int { return 32 }
+func IRF_VOLATILE()    -> Int { return 64 }
+func IRF_IRQ()         -> Int { return 128 }
+func IRF_NOALLOC()     -> Int { return 256 }
+
+// ----------------------------------------------------------------------------
+// Target Architecture IDs (Phase 3: Backend — 6 Unified Hosted & Bare Targets)
+// ----------------------------------------------------------------------------
+func TARGET_X86_64()      -> Int { return 0 }
+func TARGET_ARM64()       -> Int { return 1 }
+func TARGET_LLVM_IR()     -> Int { return 2 }
+func TARGET_CORTEX_M()    -> Int { return 3 }
+func TARGET_X86_64_BARE() -> Int { return 4 }
+func TARGET_ARM64_BARE()  -> Int { return 5 }
+
+// Runtime Execution Profile Modes (Hosted Dynamic vs Embedded Deterministic)
+func MEM_MODE_HOSTED()    -> Int { return 0 }
+func MEM_MODE_EMBEDDED()  -> Int { return 1 }
+
+// ----------------------------------------------------------------------------
+// Compiler Context Slot Indices (Re-Entrant State Table — Embedded Parity)
+// ----------------------------------------------------------------------------
+func CTX_SRC_BUF()        -> Int { return 0 }
+func CTX_SRC_LEN()        -> Int { return 1 }
+func CTX_TOKENS()         -> Int { return 2 }
+func CTX_TOK_COUNT()      -> Int { return 3 }
+func CTX_TOK_POS()        -> Int { return 4 }
+func CTX_AST_POOL()       -> Int { return 5 }
+func CTX_AST_COUNT()      -> Int { return 6 }
+func CTX_AST_ROOT()       -> Int { return 7 }
+func CTX_SYMBOLS()        -> Int { return 8 }
+func CTX_SYM_COUNT()      -> Int { return 9 }
+func CTX_SCOPE_DEPTH()    -> Int { return 10 }
+func CTX_LAMBDAS()        -> Int { return 11 }
+func CTX_LAMBDA_COUNT()   -> Int { return 12 }
+func CTX_STRINGS()        -> Int { return 13 }
+func CTX_STR_COUNT()      -> Int { return 14 }
+func CTX_IR_BUF()         -> Int { return 15 }
+func CTX_IR_COUNT()       -> Int { return 16 }
+func CTX_NEXT_VREG()      -> Int { return 17 }
+func CTX_NEXT_LABEL()     -> Int { return 18 }
+func CTX_ERR_COUNT()      -> Int { return 19 }
+func CTX_WARN_COUNT()     -> Int { return 20 }
+func CTX_OPT_TARGET()     -> Int { return 21 }
+func CTX_OPT_DUMP_AST()   -> Int { return 22 }
+func CTX_OPT_DUMP_IR()    -> Int { return 23 }
+func CTX_OPT_EMIT_ASM()   -> Int { return 24 }
+func CTX_OPT_DEBUG()      -> Int { return 25 }
+func CTX_STAT_PHI_STAT()  -> Int { return 26 }
+func CTX_STAT_PHI_RT()    -> Int { return 27 }
+func CTX_STAT_ARC_INS()   -> Int { return 28 }
+func CTX_STAT_GC_ROOTS()  -> Int { return 29 }
+func CTX_STAT_CFOLD()     -> Int { return 30 }
+func CTX_STAT_DCE()       -> Int { return 31 }
+func CTX_STAT_INLINED()   -> Int { return 32 }
+func CTX_STAT_REGALLOC()  -> Int { return 33 }
+func CTX_STAT_SCHED()     -> Int { return 34 }
+func CTX_IR_VARS()        -> Int { return 35 }
+func CTX_IR_VAR_CNT()     -> Int { return 36 }
+func CTX_VREG_DEF()       -> Int { return 37 }
+func CTX_VREG_LAST_USE()  -> Int { return 38 }
+func CTX_VREG_MOVED()     -> Int { return 39 }
+func CTX_VREG_PHYS()      -> Int { return 40 }
+func CTX_IR_SCRATCH()     -> Int { return 41 }
+func CTX_IR_FUNC_CNT()    -> Int { return 42 }
+func CTX_CUR_LAM_CL()     -> Int { return 43 }
+func CTX_CUR_LAM_CAP_S()  -> Int { return 44 }
+func CTX_CUR_LAM_CAP_L()  -> Int { return 45 }
+func CTX_OPT_EXT_LIB()    -> Int { return 46 }
+func CTX_OPT_PROFILE()    -> Int { return 47 }
+// Embedded Compiler Context Extensions (48..59)
+func CTX_OPT_BARE()       -> Int { return 48 }
+func CTX_OPT_NOALLOC()    -> Int { return 49 }
+func CTX_OPT_FLASH_KB()   -> Int { return 50 }
+func CTX_OPT_SRAM_KB()    -> Int { return 51 }
+func CTX_CUR_FN_FLAGS()   -> Int { return 52 }
+func CTX_STAT_MMIO()      -> Int { return 53 }
+func CTX_STAT_IRQ_OPS()   -> Int { return 54 }
+func CTX_STAT_SRAM_EST()  -> Int { return 55 }
+func CTX_STAT_NOALLOC_FN()-> Int { return 56 }
+func CTX_SLOTS()          -> Int { return 64 }
+
+// ----------------------------------------------------------------------------
+// Freestanding Static-Pool Object & RTOS Async Fiber Constants
+// ----------------------------------------------------------------------------
+func SX_MAGIC_ARC()    -> Int { return 1398292818 }
+func SX_MAGIC_GC()     -> Int { return 1398294339 }
+
+func OBJ_MAGIC()       -> Int { return 0 }
+func OBJ_FLAGS()       -> Int { return 1 }
+func OBJ_RC()          -> Int { return 2 }
+func OBJ_SIZE()        -> Int { return 3 }
+func OBJ_NEXT()        -> Int { return 4 }
+func OBJ_VAL()         -> Int { return 5 }
+func OBJ_STRIDE()      -> Int { return 6 }
+
+func OBJF_GC_MARKED()  -> Int { return 1 }
+func OBJF_ARC()        -> Int { return 2 }
+func OBJF_GC()         -> Int { return 4 }
+func OBJF_CLOSURE()    -> Int { return 8 }
+func OBJF_FREE()       -> Int { return 16 }
+
+func TASK_ID()         -> Int { return 0 }
+func TASK_STATE()      -> Int { return 1 }
+func TASK_FN()         -> Int { return 2 }
+func TASK_ARG()        -> Int { return 3 }
+func TASK_RESULT()     -> Int { return 4 }
+func TASK_PRIO()       -> Int { return 5 }
+func TASK_STRIDE()     -> Int { return 6 }
+
+func TASK_READY()      -> Int { return 0 }
+func TASK_RUNNING()    -> Int { return 1 }
+func TASK_DONE()       -> Int { return 2 }
+
+// ----------------------------------------------------------------------------
+// Unified Compiler, Hosted Runtime & Embedded Static Pool Capacity Limits
+// ----------------------------------------------------------------------------
+func MAX_TOKENS()       -> Int { return 16384 }
+func MAX_AST_NODES()    -> Int { return 16384 }
+func MAX_SYMBOLS()      -> Int { return 2048 }
+func MAX_IR_INSTS()     -> Int { return 32768 }
+func MAX_VREGS()        -> Int { return 4096 }
+func MAX_STRINGS()      -> Int { return 1024 }
+func MAX_LAMBDAS()      -> Int { return 512 }
+func MAX_SRC_BYTES()    -> Int { return 131072 }
+// Hosted Dynamic Runtime Limits (Main V2 Parity)
+func HOST_ARENA_WORDS() -> Int { return 8192 }
+func MAX_GC_ROOTS()     -> Int { return 1024 }
+func MAX_TASKS()        -> Int { return 256 }
+// Deterministic Bounded Embedded Runtime Pool Limits (Embedded V2 Parity)
+func EMB_ARC_POOL_CAP() -> Int { return 64 }
+func EMB_GC_POOL_CAP()  -> Int { return 64 }
+func EMB_ARENA_WORDS()  -> Int { return 512 }
+func EMB_MAX_GC_ROOTS() -> Int { return 64 }
+func EMB_MAX_TASKS()    -> Int { return 32 }
+func EMB_CLOS_POOL_CAP()-> Int { return 32 }

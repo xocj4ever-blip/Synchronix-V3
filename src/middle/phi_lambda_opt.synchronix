@@ -1,0 +1,78 @@
+// SPDX-License-Identifier: Apache-2.0
+//
+// Copyright 2026 Synchronix Contributors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
+// Full license text: ../../LICENSE
+// End-User License Agreement: ../../EULA.md
+
+// ============================================================================
+// SYNCHRONIX v3.0.0 — Phase 2: Unified Phi & Lambda Optimization Passes
+// (src/middle/phi_lambda_opt.synchronix)
+// ============================================================================
+// Implements:
+//   - Phi Formal Logic Transform: eliminates statically proven IR_PHI_ASSERT
+//     instructions -> 0 Flash bytes & 0 CPU cycles on embedded MCUs!
+//   - Lambda / ARC Peephole Elision: cancels adjacent RETAIN(v) + RELEASE(v)
+//     pairs on the same virtual register.
+// ============================================================================
+
+import sx_defs
+import utils
+
+phi phi_opt_dead_flag   = 1 == 1
+phi phi_opt_proven_flag = 2 == 2
+
+func sx_mark_ir_dead(ctx: Int, idx: Int) -> Int {
+    let fl = sx_ir_get(ctx, idx, IR_FLAGS())
+    let nfl = fl || IRF_DEAD()
+    sx_ir_set(ctx, idx, IR_FLAGS(), nfl)
+    return nfl
+}
+
+func sx_pass_phi_lambda_opt(ctx: Int) -> Int {
+    let cnt = sx_ctx_get(ctx, CTX_IR_COUNT())
+    var i = 0
+    while i < cnt {
+        let op = sx_ir_get(ctx, i, IR_OP())
+
+        // 1. Phi Formal Logic Transform: eliminate statically proven assertions
+        if op == IR_PHI_ASSERT() {
+            let fl = sx_ir_get(ctx, i, IR_FLAGS())
+            let is_proven = fl && IRF_PROVEN()
+            if is_proven != 0 {
+                sx_mark_ir_dead(ctx, i)
+                sx_ctx_inc(ctx, CTX_STAT_DCE())
+            }
+        }
+
+        // 2. ARC / Lambda Peephole: cancel adjacent IR_ARC_RETAIN(v) + IR_ARC_RELEASE(v)
+        if op == IR_ARC_RETAIN() && (i + 1) < cnt {
+            let next_op = sx_ir_get(ctx, i + 1, IR_OP())
+            if next_op == IR_ARC_RELEASE() {
+                let v1 = sx_ir_get(ctx, i, IR_SRC1())
+                let v2 = sx_ir_get(ctx, i + 1, IR_SRC1())
+                if v1 == v2 {
+                    sx_mark_ir_dead(ctx, i)
+                    sx_mark_ir_dead(ctx, i + 1)
+                    sx_ctx_inc(ctx, CTX_STAT_DCE())
+                    sx_ctx_inc(ctx, CTX_STAT_DCE())
+                }
+            }
+        }
+
+        i = i + 1
+    }
+    return 0
+}

@@ -1,0 +1,468 @@
+// SPDX-License-Identifier: Apache-2.0
+//
+// Copyright 2026 Synchronix Contributors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
+// Full license text: ../../LICENSE
+// End-User License Agreement: ../../EULA.md
+
+// ============================================================================
+// SYNCHRONIX v3.0.0 — Unified Utilities, Buffers & Compiler Context
+// (src/frontend/utils.synchronix)
+// ============================================================================
+// Pure Synchronix implementation of:
+//   - ARC-backed dynamic 64-bit slot buffers (sx_buf_new / get / set / free)
+//   - Re-entrant Compiler Context lifecycle (sx_ctx_create / reset / destroy)
+//   - Embedded Flash/SRAM budget & hardware telemetry context slots
+//   - AST node pool allocator, Token / Symbol / IR table accessors
+//   - Source slice comparison, string interning, file I/O & diagnostics
+// ============================================================================
+
+import sx_defs
+import portable_asm
+
+extern func sx_closure_alloc(fn_ptr: Int, cap: Int) -> Int;
+extern func sx_closure_set_env(buf: Int, idx: Int, value: Int) -> Int;
+extern func sx_closure_get_env(buf: Int, idx: Int) -> Int;
+extern func sx_arc_release(buf: Int) -> Int;
+
+extern func fopen(path: Int, mode: Int) -> Int;
+extern func fclose(fp: Int) -> Int;
+extern func fgetc(fp: Int) -> Int;
+extern func fputc(ch: Int, fp: Int) -> Int;
+extern func putchar(ch: Int) -> Int;
+
+phi utils_ctx_slots_ok  = 64 >= 57
+phi utils_ast_stride_ok = 12 > 11
+
+// ----------------------------------------------------------------------------
+// Dynamic 64-bit Slot Buffer Abstraction (zero-initialized)
+// ----------------------------------------------------------------------------
+func sx_buf_new(cap: Int) -> Int
+    requires cap > 0
+{
+    let buf = sx_closure_alloc(0, cap)
+    return buf
+}
+
+func sx_buf_get(buf: Int, idx: Int) -> Int
+    requires idx >= 0
+{
+    let v = sx_closure_get_env(buf, idx)
+    return v
+}
+
+func sx_buf_set(buf: Int, idx: Int, value: Int) -> Int
+    requires idx >= 0
+{
+    sx_closure_set_env(buf, idx, value)
+    return value
+}
+
+func sx_buf_free(buf: Int) -> Int {
+    if buf != 0 {
+        sx_arc_release(buf)
+    }
+    return 0
+}
+
+func sx_buf_zero(buf: Int, count: Int) -> Int {
+    var i = 0
+    while i < count {
+        sx_buf_set(buf, i, 0)
+        i = i + 1
+    }
+    return 0
+}
+
+func sx_id<T>(value: T) -> T {
+    return value
+}
+
+// ----------------------------------------------------------------------------
+// Re-Entrant Compiler Context Creation & Reset
+// ----------------------------------------------------------------------------
+func sx_ctx_get(ctx: Int, slot: Int) -> Int {
+    let v = sx_buf_get(ctx, slot)
+    return v
+}
+
+func sx_ctx_set(ctx: Int, slot: Int, value: Int) -> Int {
+    sx_buf_set(ctx, slot, value)
+    return value
+}
+
+func sx_ctx_inc(ctx: Int, slot: Int) -> Int {
+    let cur = sx_ctx_get(ctx, slot)
+    let nxt = cur + 1
+    sx_ctx_set(ctx, slot, nxt)
+    return cur
+}
+
+func sx_ctx_alloc_tables(ctx: Int) -> Int {
+    let src_cap = MAX_SRC_BYTES()
+    let src_buf = sx_buf_new(src_cap)
+    sx_ctx_set(ctx, CTX_SRC_BUF(), src_buf)
+
+    let tok_cap = MAX_TOKENS() * TOK_STRIDE()
+    let tok_buf = sx_buf_new(tok_cap)
+    sx_ctx_set(ctx, CTX_TOKENS(), tok_buf)
+
+    let ast_cap = MAX_AST_NODES() * AST_STRIDE()
+    let ast_buf = sx_buf_new(ast_cap)
+    sx_ctx_set(ctx, CTX_AST_POOL(), ast_buf)
+
+    let sym_cap = MAX_SYMBOLS() * SYME_STRIDE()
+    let sym_buf = sx_buf_new(sym_cap)
+    sx_ctx_set(ctx, CTX_SYMBOLS(), sym_buf)
+
+    let lam_cap = MAX_LAMBDAS() * 8
+    let lam_buf = sx_buf_new(lam_cap)
+    sx_ctx_set(ctx, CTX_LAMBDAS(), lam_buf)
+
+    let str_cap = MAX_STRINGS() * 2
+    let str_buf = sx_buf_new(str_cap)
+    sx_ctx_set(ctx, CTX_STRINGS(), str_buf)
+    return 0
+}
+
+func sx_ctx_alloc_ir_tables(ctx: Int) -> Int {
+    let ir_cap = MAX_IR_INSTS() * IR_STRIDE()
+    let ir_buf = sx_buf_new(ir_cap)
+    sx_ctx_set(ctx, CTX_IR_BUF(), ir_buf)
+
+    let sc_buf = sx_buf_new(ir_cap)
+    sx_ctx_set(ctx, CTX_IR_SCRATCH(), sc_buf)
+
+    let iv_buf = sx_buf_new(256 * 6)
+    sx_ctx_set(ctx, CTX_IR_VARS(), iv_buf)
+
+    let mv = MAX_VREGS()
+    let vd = sx_buf_new(mv)
+    let vl = sx_buf_new(mv)
+    let vm = sx_buf_new(mv)
+    let vp = sx_buf_new(mv)
+    sx_ctx_set(ctx, CTX_VREG_DEF(), vd)
+    sx_ctx_set(ctx, CTX_VREG_LAST_USE(), vl)
+    sx_ctx_set(ctx, CTX_VREG_MOVED(), vm)
+    sx_ctx_set(ctx, CTX_VREG_PHYS(), vp)
+    return 0
+}
+
+func sx_ctx_create() -> Int {
+    let slots = CTX_SLOTS()
+    let ctx = sx_buf_new(slots)
+    sx_ctx_alloc_tables(ctx)
+    sx_ctx_alloc_ir_tables(ctx)
+    sx_ctx_set(ctx, CTX_OPT_FLASH_KB(), HAL_DEFAULT_FLASH_KB())
+    sx_ctx_set(ctx, CTX_OPT_SRAM_KB(), HAL_DEFAULT_SRAM_KB())
+    sx_ctx_reset(ctx)
+    return ctx
+}
+
+func sx_ctx_reset(ctx: Int) -> Int {
+    sx_ctx_set(ctx, CTX_SRC_LEN(), 0)
+    sx_ctx_set(ctx, CTX_TOK_COUNT(), 0)
+    sx_ctx_set(ctx, CTX_TOK_POS(), 0)
+    sx_ctx_set(ctx, CTX_AST_COUNT(), 0)
+    sx_ctx_set(ctx, CTX_AST_ROOT(), 0)
+    sx_ctx_set(ctx, CTX_SYM_COUNT(), 0)
+    sx_ctx_set(ctx, CTX_SCOPE_DEPTH(), 0)
+    sx_ctx_set(ctx, CTX_LAMBDA_COUNT(), 0)
+    sx_ctx_set(ctx, CTX_STR_COUNT(), 0)
+    sx_ctx_set(ctx, CTX_IR_COUNT(), 0)
+    sx_ctx_set(ctx, CTX_NEXT_VREG(), 1)
+    sx_ctx_set(ctx, CTX_NEXT_LABEL(), 1)
+    sx_ctx_set(ctx, CTX_ERR_COUNT(), 0)
+    sx_ctx_set(ctx, CTX_WARN_COUNT(), 0)
+    sx_ctx_set(ctx, CTX_STAT_PHI_STAT(), 0)
+    sx_ctx_set(ctx, CTX_STAT_PHI_RT(), 0)
+    sx_ctx_set(ctx, CTX_STAT_ARC_INS(), 0)
+    sx_ctx_set(ctx, CTX_STAT_GC_ROOTS(), 0)
+    sx_ctx_set(ctx, CTX_STAT_CFOLD(), 0)
+    sx_ctx_set(ctx, CTX_STAT_DCE(), 0)
+    sx_ctx_set(ctx, CTX_STAT_INLINED(), 0)
+    sx_ctx_set(ctx, CTX_STAT_REGALLOC(), 0)
+    sx_ctx_set(ctx, CTX_STAT_SCHED(), 0)
+    sx_ctx_set(ctx, CTX_IR_VAR_CNT(), 0)
+    sx_ctx_set(ctx, CTX_IR_FUNC_CNT(), 0)
+    sx_ctx_set(ctx, CTX_CUR_LAM_CL(), 0)
+    sx_ctx_set(ctx, CTX_CUR_LAM_CAP_S(), 0)
+    sx_ctx_set(ctx, CTX_CUR_LAM_CAP_L(), 0)
+    sx_ctx_set(ctx, CTX_CUR_FN_FLAGS(), 0)
+    sx_ctx_set(ctx, CTX_STAT_MMIO(), 0)
+    sx_ctx_set(ctx, CTX_STAT_IRQ_OPS(), 0)
+    sx_ctx_set(ctx, CTX_STAT_SRAM_EST(), 0)
+    sx_ctx_set(ctx, CTX_STAT_NOALLOC_FN(), 0)
+    return 0
+}
+
+func sx_ctx_destroy(ctx: Int) -> Int {
+    let b0 = sx_ctx_get(ctx, CTX_SRC_BUF())
+    let b1 = sx_ctx_get(ctx, CTX_TOKENS())
+    let b2 = sx_ctx_get(ctx, CTX_AST_POOL())
+    let b3 = sx_ctx_get(ctx, CTX_SYMBOLS())
+    sx_buf_free(b0)
+    sx_buf_free(b1)
+    sx_buf_free(b2)
+    sx_buf_free(b3)
+
+    let b4 = sx_ctx_get(ctx, CTX_LAMBDAS())
+    let b5 = sx_ctx_get(ctx, CTX_STRINGS())
+    let b6 = sx_ctx_get(ctx, CTX_IR_BUF())
+    let b7 = sx_ctx_get(ctx, CTX_IR_SCRATCH())
+    sx_buf_free(b4)
+    sx_buf_free(b5)
+    sx_buf_free(b6)
+    sx_buf_free(b7)
+
+    let b8 = sx_ctx_get(ctx, CTX_IR_VARS())
+    let b9 = sx_ctx_get(ctx, CTX_VREG_DEF())
+    let b10 = sx_ctx_get(ctx, CTX_VREG_LAST_USE())
+    let b11 = sx_ctx_get(ctx, CTX_VREG_MOVED())
+    let b12 = sx_ctx_get(ctx, CTX_VREG_PHYS())
+    sx_buf_free(b8)
+    sx_buf_free(b9)
+    sx_buf_free(b10)
+    sx_buf_free(b11)
+    sx_buf_free(b12)
+    sx_buf_free(ctx)
+    return 0
+}
+
+// ----------------------------------------------------------------------------
+// Diagnostics: sx_error & sx_warn
+// ----------------------------------------------------------------------------
+func sx_error(ctx: Int, line: Int, msg: String) -> Int {
+    sx_ctx_inc(ctx, CTX_ERR_COUNT())
+    print("[Synchronix v3 Error] line ")
+    print(line)
+    print(": ")
+    println(msg)
+    return 0
+}
+
+func sx_warn(ctx: Int, line: Int, msg: String) -> Int {
+    sx_ctx_inc(ctx, CTX_WARN_COUNT())
+    print("[Synchronix v3 Warning] line ")
+    print(line)
+    print(": ")
+    println(msg)
+    return 0
+}
+
+// ----------------------------------------------------------------------------
+// Token Accessors (index 0..tok_count-1)
+// ----------------------------------------------------------------------------
+func sx_tok_get(ctx: Int, tok_idx: Int, field: Int) -> Int {
+    let buf = sx_ctx_get(ctx, CTX_TOKENS())
+    let base = tok_idx * TOK_STRIDE()
+    let v = sx_buf_get(buf, base + field)
+    return v
+}
+
+func sx_tok_set(ctx: Int, tok_idx: Int, field: Int, value: Int) -> Int {
+    let buf = sx_ctx_get(ctx, CTX_TOKENS())
+    let base = tok_idx * TOK_STRIDE()
+    sx_buf_set(buf, base + field, value)
+    return value
+}
+
+// ----------------------------------------------------------------------------
+// AST Pool Allocator & Accessors (1-based node IDs; 0 = null AST node)
+// ----------------------------------------------------------------------------
+func sx_ast_new(ctx: Int, kind: Int, line: Int) -> Int {
+    let cnt = sx_ctx_get(ctx, CTX_AST_COUNT())
+    let lim = MAX_AST_NODES()
+    if cnt >= lim - 1 {
+        return 0
+    }
+    let id = cnt + 1
+    sx_ctx_set(ctx, CTX_AST_COUNT(), id)
+
+    let pool = sx_ctx_get(ctx, CTX_AST_POOL())
+    let base = id * AST_STRIDE()
+    var k = 0
+    while k < AST_STRIDE() {
+        sx_buf_set(pool, base + k, 0)
+        k = k + 1
+    }
+    sx_buf_set(pool, base + AST_KIND(), kind)
+    sx_buf_set(pool, base + AST_LINE(), line)
+    return id
+}
+
+func sx_ast_get(ctx: Int, node_id: Int, field: Int) -> Int {
+    if node_id <= 0 {
+        return 0
+    }
+    let pool = sx_ctx_get(ctx, CTX_AST_POOL())
+    let base = node_id * AST_STRIDE()
+    let v = sx_buf_get(pool, base + field)
+    return v
+}
+
+func sx_ast_set(ctx: Int, node_id: Int, field: Int, value: Int) -> Int {
+    if node_id <= 0 {
+        return 0
+    }
+    let pool = sx_ctx_get(ctx, CTX_AST_POOL())
+    let base = node_id * AST_STRIDE()
+    sx_buf_set(pool, base + field, value)
+    return value
+}
+
+// ----------------------------------------------------------------------------
+// Source Buffer & Slice Comparison Utilities
+// ----------------------------------------------------------------------------
+func sx_src_char(ctx: Int, pos: Int) -> Int {
+    let len = sx_ctx_get(ctx, CTX_SRC_LEN())
+    if pos < 0 {
+        return 0
+    }
+    if pos >= len {
+        return 0
+    }
+    let buf = sx_ctx_get(ctx, CTX_SRC_BUF())
+    let ch = sx_buf_get(buf, pos)
+    return ch
+}
+
+func sx_src_eq_slice(ctx: Int, s1: Int, l1: Int, s2: Int) -> Int {
+    let buf = sx_ctx_get(ctx, CTX_SRC_BUF())
+    var i = 0
+    while i < l1 {
+        let c1 = sx_buf_get(buf, s1 + i)
+        let c2 = sx_buf_get(buf, s2 + i)
+        if c1 != c2 {
+            return 0
+        }
+        i = i + 1
+    }
+    return 1
+}
+
+func sx_slices_eq(ctx: Int, s1: Int, l1: Int, s2_packed: Int) -> Int {
+    let eq = sx_src_eq_slice(ctx, s1, l1, s2_packed)
+    return eq
+}
+
+func sx_slice_eq_cstr(ctx: Int, start: Int, slen: Int, cstr: Int) -> Int {
+    if cstr == 0 {
+        return 0
+    }
+    let clen = sx_cstr_len(cstr)
+    if slen != clen {
+        return 0
+    }
+    let buf = sx_ctx_get(ctx, CTX_SRC_BUF())
+    var i = 0
+    while i < slen {
+        let c1 = sx_buf_get(buf, start + i)
+        let c2 = sx_ptr_read8(cstr + i)
+        if c1 != c2 {
+            return 0
+        }
+        i = i + 1
+    }
+    return 1
+}
+
+func sx_src_eq2(ctx: Int, start: Int, c0: Int, c1: Int) -> Int {
+    let a = sx_src_char(ctx, start)
+    let b = sx_src_char(ctx, start + 1)
+    if a == c0 && b == c1 {
+        return 1
+    }
+    return 0
+}
+
+func sx_print_slice(ctx: Int, start: Int, len: Int) -> Int {
+    let buf = sx_ctx_get(ctx, CTX_SRC_BUF())
+    var i = 0
+    while i < len {
+        let ch = sx_buf_get(buf, start + i)
+        putchar(ch)
+        i = i + 1
+    }
+    return 0
+}
+
+func sx_fprint_slice(ctx: Int, fp: Int, start: Int, len: Int) -> Int {
+    let buf = sx_ctx_get(ctx, CTX_SRC_BUF())
+    var i = 0
+    while i < len {
+        let ch = sx_buf_get(buf, start + i)
+        fputc(ch, fp)
+        i = i + 1
+    }
+    return 0
+}
+
+// ----------------------------------------------------------------------------
+// String Literal Interning Table
+// ----------------------------------------------------------------------------
+func sx_intern_string(ctx: Int, start: Int, len: Int) -> Int {
+    let cnt = sx_ctx_get(ctx, CTX_STR_COUNT())
+    let lim = MAX_STRINGS()
+    if cnt >= lim {
+        return 0
+    }
+    let tbl = sx_ctx_get(ctx, CTX_STRINGS())
+    let base = cnt * 2
+    sx_buf_set(tbl, base, start)
+    sx_buf_set(tbl, base + 1, len)
+    sx_ctx_set(ctx, CTX_STR_COUNT(), cnt + 1)
+    return cnt
+}
+
+// ----------------------------------------------------------------------------
+// File I/O: Load .synchronix Source File into Context Source Buffer
+// ----------------------------------------------------------------------------
+func sx_read_source_file(ctx: Int, path: String) -> Int {
+    let fp = fopen(path, "rb")
+    if fp == 0 {
+        return -1
+    }
+    let buf = sx_ctx_get(ctx, CTX_SRC_BUF())
+    let lim = MAX_SRC_BYTES() - 2
+    var n = 0
+    var done = 0
+    while done == 0 {
+        let ch = fgetc(fp)
+        if ch < 0 {
+            done = 1
+        } else {
+            if n < lim {
+                sx_buf_set(buf, n, ch)
+                n = n + 1
+            } else {
+                done = 1
+            }
+        }
+    }
+    sx_buf_set(buf, n, 0)
+    fclose(fp)
+    sx_ctx_set(ctx, CTX_SRC_LEN(), n)
+    return n
+}
+
+func sx_src_push_byte(ctx: Int, ch: Int) -> Int {
+    let n = sx_ctx_get(ctx, CTX_SRC_LEN())
+    let buf = sx_ctx_get(ctx, CTX_SRC_BUF())
+    sx_buf_set(buf, n, ch)
+    sx_buf_set(buf, n + 1, 0)
+    sx_ctx_set(ctx, CTX_SRC_LEN(), n + 1)
+    return n + 1
+}

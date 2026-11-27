@@ -1,0 +1,229 @@
+// SPDX-License-Identifier: Apache-2.0
+//
+// Copyright 2026 Synchronix Contributors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
+// Full license text: ../../LICENSE
+// End-User License Agreement: ../../EULA.md
+
+// ============================================================================
+// SYNCHRONIX v3.0.0 — Ecosystem: Unified JSON-RPC 2.0 Language Server (LSP)
+// (src/tooling/lsp.synchronix)
+// ============================================================================
+// Full V2-parity IDE Language Server over stdio extended with Embedded HAL:
+//   - Exact dynamically-computed Content-Length framed JSON-RPC 2.0 responses
+//   - Supports: initialize, textDocument/hover, textDocument/completion,
+//               shutdown, exit
+//   - Completions include V2 keywords + embedded intrinsics (irq, noalloc,
+//     bare, mmio_read, mmio_write, irq_disable, irq_enable, wfi, dmb)
+// ============================================================================
+
+import sx_defs
+import portable_asm
+import utils
+
+extern func getchar() -> Int;
+extern func fflush(fp: Int) -> Int;
+extern func sx_print_str(s: Int) -> Int;
+
+phi lsp_jsonrpc_ver = 2 == 2
+
+func sx_lsp_add_key(buf: Int, key: Int) -> Int {
+    sx_cstr_cat_quoted(buf, key)
+    sx_cstr_cat(buf, ":")
+    return 0
+}
+
+func sx_lsp_add_comp_item(buf: Int, label: Int, kind: Int, add_comma: Int) -> Int {
+    if add_comma != 0 {
+        sx_cstr_cat(buf, ",")
+    }
+    sx_cstr_cat(buf, "{")
+    sx_lsp_add_key(buf, "label")
+    sx_cstr_cat_quoted(buf, label)
+    sx_cstr_cat(buf, ",")
+    sx_lsp_add_key(buf, "kind")
+    if kind == 14 {
+        sx_cstr_cat(buf, "14}")
+    } else {
+        sx_cstr_cat(buf, "3}")
+    }
+    return 0
+}
+
+func sx_lsp_send_raw(body: Int) -> Int {
+    let blen = sx_cstr_len(body)
+    print("Content-Length: ")
+    print(blen)
+    print("\r\n\r\n")
+    sx_print_str(body)
+    fflush(0)
+    return 0
+}
+
+func sx_lsp_send_init() -> Int {
+    let b = sx_cstr_alloc(1024)
+    sx_cstr_cat(b, "{")
+    sx_lsp_add_key(b, "jsonrpc"); sx_cstr_cat_quoted(b, "2.0"); sx_cstr_cat(b, ",")
+    sx_lsp_add_key(b, "id"); sx_cstr_cat(b, "1,")
+    sx_lsp_add_key(b, "result"); sx_cstr_cat(b, "{")
+    sx_lsp_add_key(b, "serverInfo"); sx_cstr_cat(b, "{")
+    sx_lsp_add_key(b, "name"); sx_cstr_cat_quoted(b, "synchronix-lsp"); sx_cstr_cat(b, ",")
+    sx_lsp_add_key(b, "version"); sx_cstr_cat_quoted(b, "3.0.0"); sx_cstr_cat(b, "},")
+    sx_lsp_add_key(b, "capabilities"); sx_cstr_cat(b, "{")
+    sx_lsp_add_key(b, "textDocumentSync"); sx_cstr_cat(b, "1,")
+    sx_lsp_add_key(b, "hoverProvider"); sx_cstr_cat(b, "true,")
+    sx_lsp_add_key(b, "completionProvider"); sx_cstr_cat(b, "{")
+    sx_lsp_add_key(b, "triggerCharacters"); sx_cstr_cat(b, "[")
+    sx_cstr_cat_quoted(b, "."); sx_cstr_cat(b, ","); sx_cstr_cat_quoted(b, ":")
+    sx_cstr_cat(b, "]},")
+    sx_lsp_add_key(b, "documentFormattingProvider"); sx_cstr_cat(b, "true}}}")
+    sx_lsp_send_raw(b)
+    sx_cstr_free(b)
+    return 0
+}
+
+func sx_lsp_send_hover() -> Int {
+    let b = sx_cstr_alloc(1024)
+    sx_cstr_cat(b, "{")
+    sx_lsp_add_key(b, "jsonrpc"); sx_cstr_cat_quoted(b, "2.0"); sx_cstr_cat(b, ",")
+    sx_lsp_add_key(b, "id"); sx_cstr_cat(b, "2,")
+    sx_lsp_add_key(b, "result"); sx_cstr_cat(b, "{")
+    sx_lsp_add_key(b, "contents"); sx_cstr_cat(b, "{")
+    sx_lsp_add_key(b, "kind"); sx_cstr_cat_quoted(b, "markdown"); sx_cstr_cat(b, ",")
+    sx_lsp_add_key(b, "value")
+    sx_cstr_cat_quoted(b, "**Synchronix v3** - Unified Hosted & Bare-Metal native language with dual-mode ARC+GC, Phi formal verification, Lambda closures, M:N/RTOS fibers, noalloc ISRs, and volatile MMIO.")
+    sx_cstr_cat(b, "}}}")
+    sx_lsp_send_raw(b)
+    sx_cstr_free(b)
+    return 0
+}
+
+func sx_lsp_send_completion() -> Int {
+    let b = sx_cstr_alloc(3072)
+    sx_cstr_cat(b, "{")
+    sx_lsp_add_key(b, "jsonrpc"); sx_cstr_cat_quoted(b, "2.0"); sx_cstr_cat(b, ",")
+    sx_lsp_add_key(b, "id"); sx_cstr_cat(b, "3,")
+    sx_lsp_add_key(b, "result"); sx_cstr_cat(b, "[")
+    sx_lsp_add_comp_item(b, "func",        14, 0)
+    sx_lsp_add_comp_item(b, "irq",         14, 1)
+    sx_lsp_add_comp_item(b, "noalloc",     14, 1)
+    sx_lsp_add_comp_item(b, "bare",        14, 1)
+    sx_lsp_add_comp_item(b, "arc",         14, 1)
+    sx_lsp_add_comp_item(b, "gc",          14, 1)
+    sx_lsp_add_comp_item(b, "borrow",      14, 1)
+    sx_lsp_add_comp_item(b, "move",        14, 1)
+    sx_lsp_add_comp_item(b, "phi",         14, 1)
+    sx_lsp_add_comp_item(b, "requires",    14, 1)
+    sx_lsp_add_comp_item(b, "ensures",     14, 1)
+    sx_lsp_add_comp_item(b, "prove",       14, 1)
+    sx_lsp_add_comp_item(b, "lambda",      14, 1)
+    sx_lsp_add_comp_item(b, "async",       14, 1)
+    sx_lsp_add_comp_item(b, "spawn",       14, 1)
+    sx_lsp_add_comp_item(b, "await",       14, 1)
+    sx_lsp_add_comp_item(b, "mmio_read",    3, 1)
+    sx_lsp_add_comp_item(b, "mmio_write",   3, 1)
+    sx_lsp_add_comp_item(b, "irq_disable",  3, 1)
+    sx_lsp_add_comp_item(b, "irq_enable",   3, 1)
+    sx_lsp_add_comp_item(b, "wfi",          3, 1)
+    sx_lsp_add_comp_item(b, "dmb",          3, 1)
+    sx_lsp_add_comp_item(b, "println",      3, 1)
+    sx_lsp_add_comp_item(b, "mem_stats",    3, 1)
+    sx_cstr_cat(b, "]}")
+    sx_lsp_send_raw(b)
+    sx_cstr_free(b)
+    return 0
+}
+
+func sx_lsp_send_ok() -> Int {
+    let b = sx_cstr_alloc(256)
+    sx_cstr_cat(b, "{")
+    sx_lsp_add_key(b, "jsonrpc"); sx_cstr_cat_quoted(b, "2.0"); sx_cstr_cat(b, ",")
+    sx_lsp_add_key(b, "id"); sx_cstr_cat(b, "99,")
+    sx_lsp_add_key(b, "result"); sx_cstr_cat(b, "null}")
+    sx_lsp_send_raw(b)
+    sx_cstr_free(b)
+    return 0
+}
+
+func sx_lsp_has_method(inbuf: Int, method_name: Int) -> Int {
+    let needle = sx_cstr_alloc(128)
+    sx_cstr_cat_quoted(needle, method_name)
+    let hit = sx_cstr_contains(inbuf, needle)
+    sx_cstr_free(needle)
+    return hit
+}
+
+func sx_cmd_lsp() -> Int {
+    let inbuf = sx_cstr_alloc(8192)
+    var running = 1
+
+    while running != 0 {
+        var len = 0
+        var depth = 0
+        var saw = 0
+        var reading = 1
+
+        while reading != 0 {
+            let ch = getchar()
+            if ch < 0 {
+                reading = 0
+                running = 0
+            } else {
+                if len < 8190 {
+                    sx_ptr_write8(inbuf + len, ch)
+                    len = len + 1
+                } else {
+                    reading = 0
+                }
+                if ch == 123 {
+                    depth = depth + 1
+                    saw = 1
+                }
+                if ch == 125 {
+                    depth = depth - 1
+                    if saw != 0 && depth <= 0 {
+                        reading = 0
+                    }
+                }
+            }
+        }
+
+        if running != 0 && len > 0 {
+            sx_ptr_write8(inbuf + len, 0)
+            if sx_lsp_has_method(inbuf, "initialize") != 0 {
+                sx_lsp_send_init()
+            } else {
+                if sx_lsp_has_method(inbuf, "textDocument/hover") != 0 {
+                    sx_lsp_send_hover()
+                } else {
+                    if sx_lsp_has_method(inbuf, "textDocument/completion") != 0 {
+                        sx_lsp_send_completion()
+                    } else {
+                        if sx_lsp_has_method(inbuf, "shutdown") != 0 {
+                            sx_lsp_send_ok()
+                        } else {
+                            if sx_lsp_has_method(inbuf, "exit") != 0 {
+                                running = 0
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    sx_cstr_free(inbuf)
+    return 0
+}

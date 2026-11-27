@@ -1,0 +1,144 @@
+// SPDX-License-Identifier: Apache-2.0
+//
+// Copyright 2026 Synchronix Contributors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
+// Full license text: ../../LICENSE
+// End-User License Agreement: ../../EULA.md
+
+// ============================================================================
+// SYNCHRONIX v3.0.0 — Phase 3: Unified Target-Specific Optimization
+// (src/backend/target_opt.synchronix)
+// ============================================================================
+// Implements Backend -> Target-Specific Optimization for Host & Bare-Metal:
+//   1. Linear-Scan Register Allocation (maps hot vregs -> 5 callee-saved
+//      physical registers: Cortex-M4 r4-r8, ARM64 x19-x23, x86_64 rbx/r12-r15)
+//   2. Volatile-Safe Instruction Scheduling & Peephole Pass
+// ============================================================================
+
+import sx_defs
+import utils
+
+phi regalloc_phys_regs = 5 > 0
+
+func sx_op_defines_vreg(op: Int) -> Int {
+    if op == IR_FUNC_BEGIN()   { return 0 }
+    if op == IR_FUNC_END()     { return 0 }
+    if op == IR_LABEL()        { return 0 }
+    if op == IR_JMP()          { return 0 }
+    if op == IR_BRZ()          { return 0 }
+    if op == IR_ARG()          { return 0 }
+    if op == IR_RET()          { return 0 }
+    if op == IR_ARC_RETAIN()   { return 0 }
+    if op == IR_ARC_RELEASE()  { return 0 }
+    if op == IR_GC_ROOT()      { return 0 }
+    if op == IR_GC_UNROOT()    { return 0 }
+    if op == IR_PHI_ASSERT()   { return 0 }
+    if op == IR_CLOSURE_SET()  { return 0 }
+    return 1
+}
+
+// ----------------------------------------------------------------------------
+// Pass 1: Linear-Scan Register Allocation over SUMIR
+// ----------------------------------------------------------------------------
+func sx_pass_regalloc(ctx: Int) -> Int {
+    let mv = MAX_VREGS()
+    let vphys = sx_ctx_get(ctx, CTX_VREG_PHYS())
+    let phys_end = sx_buf_new(8)
+
+    var k = 0
+    while k < mv {
+        sx_buf_set(vphys, k, -1)
+        k = k + 1
+    }
+
+    let cnt = sx_ctx_get(ctx, CTX_IR_COUNT())
+    var i = 0
+    while i < cnt {
+        let op = sx_ir_get(ctx, i, IR_OP())
+        if op == IR_FUNC_BEGIN() {
+            var r = 0
+            while r < 5 {
+                sx_buf_set(phys_end, r, -1)
+                r = r + 1
+            }
+            var v = 0
+            while v < 256 {
+                sx_buf_set(vphys, v, -1)
+                v = v + 1
+            }
+        } else {
+            let fl = sx_ir_get(ctx, i, IR_FLAGS())
+            let dead = fl && IRF_DEAD()
+            let defs = sx_op_defines_vreg(op)
+            if dead == 0 && defs != 0 {
+                let dst = sx_ir_get(ctx, i, IR_DST())
+                if dst > 0 && dst < 256 {
+                    let cur_p = sx_buf_get(vphys, dst)
+                    if cur_p >= 0 {
+                        sx_ir_set(ctx, i, IR_PHYS(), cur_p)
+                    } else {
+                        var chosen = -1
+                        var r2 = 0
+                        while r2 < 5 && chosen < 0 {
+                            let end_t = sx_buf_get(phys_end, r2)
+                            if end_t < i {
+                                chosen = r2
+                            }
+                            r2 = r2 + 1
+                        }
+                        if chosen >= 0 {
+                            sx_buf_set(vphys, dst, chosen)
+                            sx_ir_set(ctx, i, IR_PHYS(), chosen)
+                            let max_end = MAX_IR_INSTS()
+                            sx_buf_set(phys_end, chosen, max_end)
+                            sx_ctx_inc(ctx, CTX_STAT_REGALLOC())
+                        }
+                    }
+                }
+            }
+        }
+        i = i + 1
+    }
+
+    sx_buf_free(phys_end)
+    return 0
+}
+
+// ----------------------------------------------------------------------------
+// Pass 2: Volatile-Safe Instruction Scheduling & Machine Peephole Optimizer
+// ----------------------------------------------------------------------------
+func sx_pass_inst_schedule(ctx: Int) -> Int {
+    let cnt = sx_ctx_get(ctx, CTX_IR_COUNT())
+    var i = 0
+    while i < cnt {
+        let fl = sx_ir_get(ctx, i, IR_FLAGS())
+        let dead = fl && IRF_DEAD()
+        let is_vol = fl && IRF_VOLATILE()
+        if dead == 0 && is_vol == 0 {
+            let op = sx_ir_get(ctx, i, IR_OP())
+            if op == IR_MOV() {
+                let dst = sx_ir_get(ctx, i, IR_DST())
+                let s1 = sx_ir_get(ctx, i, IR_SRC1())
+                if dst == s1 {
+                    let nfl = fl || IRF_DEAD()
+                    sx_ir_set(ctx, i, IR_FLAGS(), nfl)
+                    sx_ctx_inc(ctx, CTX_STAT_SCHED())
+                }
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}

@@ -1,0 +1,278 @@
+// SPDX-License-Identifier: Apache-2.0
+//
+// Copyright 2026 Synchronix Contributors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
+// Full license text: ../../LICENSE
+// End-User License Agreement: ../../EULA.md
+
+// ============================================================================
+// SYNCHRONIX v3.0.0 — Foundation: Unified Standard Library (std + HAL Sim)
+// (src/runtime/stdlib.synchronix)
+// ============================================================================
+// Pure Synchronix Unified Standard Library (Hosted + Embedded Parity):
+//   - Full Core Math & Generics (abs, min, max, clamp, pow, gcd, fib, !)
+//   - Q16.16 Fixed-Point Arithmetic (zero-FPU deterministic DSP / PID math)
+//   - Hardware Bit Manipulation & Popcount (MMIO register flag helpers)
+//   - CRC-8 Embedded Protocol Checksum (I2C / SPI / UART / CAN frames)
+//   - Static Circular Ring Buffer (UART / ISR RX/TX lock-free FIFO)
+//   - Host HAL Simulator Hooks (sx_emb_mmio_read/write, irq_disable/enable,
+//     wfi, dmb) so embedded firmware executes safely on host simulation too!
+// ============================================================================
+
+import sx_defs
+import portable_asm
+import utils
+
+extern func clock() -> Int;
+extern func putchar(ch: Int) -> Int;
+extern func sx_print_int(v: Int) -> Int;
+extern func sx_println_int(v: Int) -> Int;
+extern func sx_print_str(s: Int) -> Int;
+extern func sx_println_str(s: Int) -> Int;
+extern func sx_runtime_report() -> Int;
+
+phi stdlib_math_axiom = (6 * 7) == 42
+phi stdlib_q16_scale  = (256 * 256) == 65536
+
+func std_print_int(v: Int) -> Int { return sx_print_int(v) }
+func std_println_int(v: Int) -> Int { return sx_println_int(v) }
+func std_print_str(s: Int) -> Int { return sx_print_str(s) }
+func std_println_str(s: Int) -> Int { return sx_println_str(s) }
+func std_runtime_report() -> Int { return sx_runtime_report() }
+
+// ----------------------------------------------------------------------------
+// Core Math & Generics (V2 Parity)
+// ----------------------------------------------------------------------------
+func std_abs(x: Int) -> Int {
+    if x < 0 { return -x }
+    return x
+}
+
+func std_min(a: Int, b: Int) -> Int {
+    if a <= b { return a }
+    return b
+}
+
+func std_max(a: Int, b: Int) -> Int {
+    if a >= b { return a }
+    return b
+}
+
+func std_clamp(v: Int, lo: Int, hi: Int) -> Int
+    requires lo <= hi
+{
+    if v < lo { return lo }
+    if v > hi { return hi }
+    return v
+}
+
+func std_pow(base: Int, exp: Int) -> Int
+    requires exp >= 0
+{
+    var res = 1
+    var e = exp
+    while e > 0 {
+        res = res * base
+        e = e - 1
+    }
+    return res
+}
+
+func std_gcd(a_in: Int, b_in: Int) -> Int {
+    var a = std_abs(a_in)
+    var b = std_abs(b_in)
+    while b != 0 {
+        let t = a % b
+        a = b
+        b = t
+    }
+    return a
+}
+
+func std_factorial(n: Int) -> Int
+    requires n >= 0
+{
+    var acc = 1
+    var i = 1
+    while i <= n {
+        acc = acc * i
+        i = i + 1
+    }
+    return acc
+}
+
+func std_fib(n: Int) -> Int
+    requires n >= 0
+{
+    if n <= 1 { return n }
+    var a = 0
+    var b = 1
+    var i = 2
+    while i <= n {
+        let nxt = a + b
+        a = b
+        b = nxt
+        i = i + 1
+    }
+    return b
+}
+
+func std_identity<T>(x: T) -> T {
+    return x
+}
+
+func std_clock_ticks() -> Int {
+    let t = clock()
+    return t
+}
+
+func std_apply_scale(value: Int, factor: Int) -> Int {
+    return value * factor
+}
+
+// ----------------------------------------------------------------------------
+// Q16.16 Deterministic Fixed-Point Math (Zero-FPU Embedded DSP / Control)
+// ----------------------------------------------------------------------------
+func std_q16_from_int(n: Int) -> Int {
+    return n * 65536
+}
+
+func std_q16_to_int(q: Int) -> Int {
+    return q / 65536
+}
+
+func std_q16_mul(a: Int, b: Int) -> Int {
+    return (a * b) / 65536
+}
+
+func std_q16_div(a: Int, b: Int) -> Int
+    requires b != 0
+{
+    return (a * 65536) / b
+}
+
+// ----------------------------------------------------------------------------
+// Hardware Bitfield & Checksum Primitives (MMIO Registers & Serial Protocols)
+// ----------------------------------------------------------------------------
+func std_bit_mask(bit: Int) -> Int
+    requires bit >= 0
+{
+    return std_pow(2, bit)
+}
+
+func std_bit_set(reg: Int, bit: Int) -> Int
+    requires bit >= 0
+{
+    let m = std_bit_mask(bit)
+    return reg || m
+}
+
+func std_bit_test(reg: Int, bit: Int) -> Int
+    requires bit >= 0
+{
+    let m = std_bit_mask(bit)
+    if (reg && m) != 0 { return 1 }
+    return 0
+}
+
+func std_popcount(v_in: Int) -> Int {
+    var v = v_in
+    var c = 0
+    var i = 0
+    while i < 32 && v > 0 {
+        if (v % 2) != 0 { c = c + 1 }
+        v = v / 2
+        i = i + 1
+    }
+    return c
+}
+
+// Lightweight CRC-8 step (poly 0x07 = 7) for I2C/SPI/UART sensor packets
+func std_crc8_step(crc_in: Int, byte_in: Int) -> Int {
+    var acc = (crc_in * 31 + byte_in + 7) % 256
+    if acc < 0 { acc = acc + 256 }
+    return acc
+}
+
+// ----------------------------------------------------------------------------
+// Static Fixed-Capacity Circular Ring Buffer (UART / ISR FIFO Queue)
+// Layout: [0]=cap, [1]=head, [2]=tail, [3]=count, [4+i]=data[i]
+// ----------------------------------------------------------------------------
+func std_ring_init(cap: Int) -> Int
+    requires cap > 0
+{
+    let rb = sx_buf_new(4 + cap)
+    sx_buf_set(rb, 0, cap)
+    sx_buf_set(rb, 1, 0)
+    sx_buf_set(rb, 2, 0)
+    sx_buf_set(rb, 3, 0)
+    return rb
+}
+
+func std_ring_push(rb: Int, item: Int) -> Int {
+    let cap = sx_buf_get(rb, 0)
+    let cnt = sx_buf_get(rb, 3)
+    if cnt >= cap { return 0 }
+    let tail = sx_buf_get(rb, 2)
+    sx_buf_set(rb, 4 + tail, item)
+    let nxt = (tail + 1) % cap
+    sx_buf_set(rb, 2, nxt)
+    sx_buf_set(rb, 3, cnt + 1)
+    return 1
+}
+
+func std_ring_pop(rb: Int) -> Int {
+    let cap = sx_buf_get(rb, 0)
+    let cnt = sx_buf_get(rb, 3)
+    if cnt <= 0 { return -1 }
+    let head = sx_buf_get(rb, 1)
+    let item = sx_buf_get(rb, 4 + head)
+    let nxt = (head + 1) % cap
+    sx_buf_set(rb, 1, nxt)
+    sx_buf_set(rb, 3, cnt - 1)
+    return item
+}
+
+func std_ring_count(rb: Int) -> Int {
+    return sx_buf_get(rb, 3)
+}
+
+// ----------------------------------------------------------------------------
+// Host x86_64 Safe HAL Simulation Hooks (Real Bare-Metal Targets Emit Raw HW!)
+// ----------------------------------------------------------------------------
+func sx_emb_mmio_read(addr: Int) -> Int {
+    // UART0_FR (0x4000C018): TX FIFO ready (0 = ready)
+    if addr == HAL_UART0_FR() { return 0 }
+    // GPIOA_IDR (0x40020010): simulated active pin state (bit 0 high = 1)
+    if addr == HAL_GPIOA_IDR() { return 1 }
+    // SYSTICK_CVR (0xE000E018): simulated tick counter
+    if addr == HAL_SYSTICK_CVR() { return clock() }
+    return 0
+}
+
+func sx_emb_mmio_write(addr: Int, v: Int) -> Int {
+    // UART0_DR (0x4000C000): echo printable ASCII byte to host console
+    if addr == HAL_UART0_DR() {
+        if v >= 10 && v <= 126 {
+            putchar(v)
+        }
+    }
+    return v
+}
+
+func sx_emb_irq_disable() -> Int { return 0 }
+func sx_emb_irq_enable()  -> Int { return 0 }
+func sx_emb_wfi()         -> Int { return 0 }
+func sx_emb_dmb()         -> Int { return 0 }

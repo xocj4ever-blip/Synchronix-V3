@@ -1,0 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Negative test: Embedded Phi Verifier must statically reject unaligned MMIO!
+bare noalloc func main() -> Int {
+    let bad = mmio_read(0x4002_0003)
+    return bad
+}

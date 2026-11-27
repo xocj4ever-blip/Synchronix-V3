@@ -1,0 +1,67 @@
+// SPDX-License-Identifier: Apache-2.0
+//
+// Copyright 2026 Synchronix Contributors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
+// Full license text: ../LICENSE
+// End-User License Agreement: ../EULA.md
+
+// ============================================================================
+// STANDALONE BARE-METAL FIRMWARE (examples/bare_blink.synchronix)
+// ============================================================================
+// Zero external dependencies (no libc, no OS, no heap)!
+// Compiles and links directly into a self-contained bare-metal .elf firmware
+// image for ARM Cortex-M4, ARM64-bare, and x86_64-bare:
+//   synchronix_emb compile examples/bare_blink.synchronix --target cortex-m --bare --noalloc -o build/bare_blink_m4
+//   synchronix_emb compile examples/bare_blink.synchronix --target arm64    --bare --noalloc -o build/bare_blink_a64
+//   synchronix_emb compile examples/bare_blink.synchronix --target x86_64-bare --bare --noalloc -o build/bare_blink_x64
+// ============================================================================
+
+phi blink_gpio_aligned = (0x4002_0014 % 4) == 0
+phi blink_uart_aligned = (0x4000_C000 % 4) == 0
+
+irq noalloc func tim2_irq_handler() -> Int {
+    let cur = mmio_read(0x4002_0010)
+    mmio_write(0x4002_0014, cur)
+    dmb()
+    return cur
+}
+
+bare noalloc func delay_cycles(count: Int) -> Int {
+    var i = 0
+    while i < count {
+        i = i + 1
+    }
+    return i
+}
+
+bare noalloc func main() -> Int {
+    prove 0x4002_0014 != 0
+    irq_disable()
+    mmio_write(0x4002_0000, 1)
+    mmio_write(0x4000_C000, 66)
+    irq_enable()
+
+    var led = 0
+    var ticks = 0
+    while ticks < 10 {
+        if led == 0 { led = 1 } else { led = 0 }
+        mmio_write(0x4002_0014, led)
+        dmb()
+        delay_cycles(1000)
+        ticks = ticks + 1
+    }
+    wfi()
+    return ticks
+}

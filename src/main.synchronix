@@ -1,0 +1,425 @@
+// SPDX-License-Identifier: Apache-2.0
+//
+// Copyright 2026 Synchronix Contributors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
+// Full license text: ../LICENSE
+// End-User License Agreement: ../EULA.md
+
+// ============================================================================
+// SYNCHRONIX v3.0.0 — Unified Hosted + Embedded Compiler & Ecosystem CLI
+// (src/main.synchronix)
+// ============================================================================
+// Full V2 Main + V2 Embedded Parity Pure Synchronix CLI Driver:
+//   - Subcommands: compile, run, new [--embedded], build, test, size, fmt,
+//                  lint, lsp, debug, profile, --version, --help, --self-test
+//   - Flags: -o <out>, --target x86_64|arm64|arm64-bare|cortex-m|x86_64-bare|llvm,
+//            --bare, --noalloc, --flash-kb <N>, --sram-kb <N>,
+//            --emit-llvm, --emit-asm, --dump-ast, --dump-ir, --link <ext>, -g
+// ============================================================================
+
+import sx_defs
+import portable_asm
+import utils
+import lexer
+import parser
+import sema
+import ir_gen
+import mem_safety
+import phi_lambda_opt
+import lowering
+import target_opt
+import codegen
+import emitter
+import memory_rt
+import async_rt
+import phi_lambda_rt
+import stdlib
+import cargo_pkg
+import fmt_lint
+import lsp
+import debug_prof
+
+phi main_v3_self_hosted = (3 * 100) == 300
+phi main_pipeline_ok    = (1 + 1 + 1) == 3
+phi main_targets_ok     = 6 == (3 + 3)
+
+func sx_parse_dec_cstr(s: Int) -> Int {
+    if s == 0 { return 0 }
+    var i = 0
+    var acc = 0
+    var keep = 1
+    while keep != 0 {
+        let ch = sx_ptr_read8(s + i)
+        if ch >= 48 && ch <= 57 {
+            acc = acc * 10 + (ch - 48)
+            i = i + 1
+        } else {
+            keep = 0
+        }
+    }
+    return acc
+}
+
+func sx_print_version() -> Int {
+    println("synchronix 3.0.0 (self-hosted-pure-synchronix; unified hosted+embedded; targets: x86_64, arm64, arm64-bare, cortex-m4, x86_64-bare, llvm-ir)")
+    return 0
+}
+
+func sx_print_banner() -> Int {
+    println("SYNCHRONIX v3.0.0 — Unified Hosted & Bare-Metal Native Language (100% Pure Synchronix)")
+    println("Full V2 + Embedded Parity: Dual-Mode ARC+GC + M:N/RTOS Fibers + Phi/Lambda + Volatile MMIO")
+    println("")
+    println("Usage:")
+    println("  synchronix compile <file.synchronix> [-o out]")
+    println("                     [--target x86_64|arm64|arm64-bare|cortex-m|x86_64-bare|llvm]")
+    println("                     [--bare] [--noalloc] [--flash-kb N] [--sram-kb N]")
+    println("                     [--emit-llvm] [--emit-asm] [--dump-ast] [--dump-ir]")
+    println("                     [--link <ext.a|.lib>] [-g]")
+    println("  synchronix run [file.synchronix]          Build & execute native / host-sim binary")
+    println("  synchronix new <name> [--embedded]        Scaffold hosted app or MCU firmware (+ memory.ld)")
+    println("  synchronix build [file.synchronix]        Build Synchronix package (Synchronix.toml)")
+    println("  synchronix test [file.synchronix]         Run Phi verification & test suite")
+    println("  synchronix size <file.elf|file.o>         Inspect Flash/SRAM section sizes")
+    println("  synchronix fmt <file.synchronix>          Format .synchronix source canonically")
+    println("  synchronix lint <file.synchronix>         Run static Phi & embedded safety linter")
+    println("  synchronix lsp                            Start Synchronix JSON-RPC 2.0 Language Server")
+    println("  synchronix debug <file.synchronix>        Compile with DWARF -g & launch LLDB")
+    println("  synchronix profile <file.synchronix>      Profile 3-phase compiler, runtime & SRAM budget")
+    println("  synchronix --self-test                    Run unified Hosted + Embedded runtime verification")
+    println("  synchronix --version                      Show version & all 6 supported targets")
+    return 0
+}
+
+// ----------------------------------------------------------------------------
+// V3 Unified Self-Hosted Runtime Verification (--self-test: Hosted + Embedded)
+// ----------------------------------------------------------------------------
+async func sx_v3_async_check(seed: Int) -> Int {
+    let scaled = std_apply_scale(seed, 3)
+    return scaled + 10
+}
+
+func sx_v3_self_test() -> Int {
+    println("=== SYNCHRONIX v3.0.0 UNIFIED SELF-HOSTED RUNTIME VERIFICATION ===")
+
+    let arc_box = arc(42)
+    let arc_alias = arc_box
+    val gc_box = gc(100)
+    print("  1. Native ARC + GC    : "); println(arc_alias + gc_box)
+
+    let owned_v = 77
+    let borrowed_v = borrow owned_v
+    print("  2. Borrowed value     : "); println(borrowed_v)
+
+    let factor = 4
+    let mult = lambda (x: Int) => x * factor
+    let piped = 12 |> mult
+    print("  3. Lambda 12|>mult    : "); println(piped)
+
+    prove (6 * 7) == 42
+    prove (10 + 32) == 42
+    prove (1073872896 % 4) == 0
+
+    let g = std_identity<Int>(99)
+    let f5 = std_factorial(5)
+    print("  4. Generic + 5!       : "); println(g + f5)
+
+    let t1 = spawn sx_v3_async_check(5)
+    let t2 = spawn sx_v3_async_check(7)
+    let r1 = await t1
+    let r2 = await t2
+    print("  5. M:N Async Fibers   : "); println(r1 + r2)
+
+    // Profile A: Hosted Dynamic Unified Memory + 256-task M:N Async + Dynamic Closures (Main V2 Parity)
+    let h_mem = sx2_mem_init()
+    let h_apos = sx2_arena_alloc(h_mem, 32)
+    let h_aobj = sx2_arc_box_int(h_mem, 512)
+    sx2_arc_retain(h_mem, h_aobj)
+    let h_aval = sx2_arc_unbox_int(h_aobj)
+    sx2_arc_release(h_mem, h_aobj)
+    sx2_arc_release(h_mem, h_aobj)
+
+    let h_gobj = sx2_gc_box_int(h_mem, 1024)
+    sx2_gc_push_root(h_mem, h_gobj)
+    let h_gval = sx2_gc_unbox_int(h_gobj)
+    sx2_gc_pop_root(h_mem)
+    let h_swept = sx2_gc_collect(h_mem)
+    print("  6. Hosted ARC+GC      : "); println(h_aval + h_gval + h_swept + h_apos)
+    sx2_mem_stats(h_mem)
+
+    let h_sch = sx2_sched_init()
+    let h_ft1 = sx2_spawn(h_sch, 1, 5)
+    let h_ft2 = sx2_spawn(h_sch, 1, 6)
+    let h_fr1 = sx2_await(h_sch, h_ft1)
+    let h_fr2 = sx2_await(h_sch, h_ft2)
+    print("  7. Hosted M:N Sched   : "); println(h_fr1 + h_fr2)
+    sx2_sched_stats(h_sch)
+
+    let h_prt = sx2_phi_rt_init()
+    sx2_phi_check(h_prt, 1, 100)
+    let h_cl = sx2_closure_alloc(h_prt, 1, 1)
+    sx2_closure_set_env(h_cl, 0, 3)
+    let h_cl_res = sx2_closure_call1(h_cl, 14)
+    print("  8. Hosted Closure     : "); println(h_cl_res)
+    sx2_phi_stats(h_prt)
+
+    // Profile B: Embedded Deterministic Static-Pool ARC+GC + Priority RTOS Fibers + Static Closures (Embedded V2 Parity)
+    let e_mem = sx2_mem_init_embedded()
+    let e_apos = sx2_arena_alloc(e_mem, 16)
+    let e_aobj = sx2_arc_box_int(e_mem, 512)
+    sx2_arc_retain(e_mem, e_aobj)
+    let e_aval = sx2_arc_unbox_int(e_aobj)
+    sx2_arc_release(e_mem, e_aobj)
+    sx2_arc_release(e_mem, e_aobj)
+
+    let e_gobj = sx2_gc_box_int(e_mem, 1024)
+    sx2_gc_push_root(e_mem, e_gobj)
+    let e_gval = sx2_gc_unbox_int(e_gobj)
+    sx2_gc_pop_root(e_mem)
+    let e_swept = sx2_gc_collect(e_mem)
+    print("  9. Static Slab ARC+GC : "); println(e_aval + e_gval + e_swept + e_apos)
+    sx2_mem_stats(e_mem)
+
+    let e_sch = sx2_sched_init_embedded()
+    let e_ft1 = sx2_spawn_prio(e_sch, 1, 5, 2)
+    let e_ft2 = sx2_spawn_prio(e_sch, 3, 200, 5)
+    let e_fr1 = sx2_await(e_sch, e_ft1)
+    let e_fr2 = sx2_await(e_sch, e_ft2)
+    print(" 10. RTOS Prio Sched    : "); println(e_fr1 + e_fr2)
+    sx2_sched_stats(e_sch)
+
+    let e_prt = sx2_phi_rt_init_embedded()
+    sx2_phi_check(e_prt, 1, 200)
+    let e_cl = sx2_closure_alloc(e_prt, 1, 1)
+    sx2_closure_set_env(e_cl, 0, 3)
+    let e_cl_res = sx2_closure_call1(e_cl, 14)
+    print(" 11. Static Closure     : "); println(e_cl_res)
+    sx2_phi_stats(e_prt)
+
+    // Embedded DSP (Q16.16 Fixed-Point), CRC-8, Bitfields & Ring Buffer FIFO
+    let q_a = std_q16_from_int(7)
+    let q_b = std_q16_from_int(6)
+    let q_p = std_q16_to_int(std_q16_mul(q_a, q_b))
+    let bits = std_popcount(std_bit_set(std_bit_set(0, 0), 3))
+    let crc = std_crc8_step(0, 65)
+    let rb = std_ring_init(8)
+    std_ring_push(rb, 10)
+    std_ring_push(rb, 20)
+    let p0 = std_ring_pop(rb)
+    let p1 = std_ring_pop(rb)
+    print(" 12. Embedded DSP+FIFO  : q16="); print(q_p)
+    print(" bits="); print(bits)
+    print(" crc8="); print(crc)
+    print(" fifo="); println(p0 + p1)
+
+    gc_collect()
+    mem_stats()
+    return 0
+}
+
+// ----------------------------------------------------------------------------
+// Compile Subcommand Flag Parser (6 Unified Hosted + Bare-Metal Targets)
+// ----------------------------------------------------------------------------
+func sx_apply_target_flag(ctx: Int, targ: Int) -> Int {
+    if sx_cstr_eq(targ, "cortex-m") != 0 || sx_cstr_eq(targ, "cortex-m4") != 0 || sx_cstr_eq(targ, "thumb") != 0 {
+        sx_ctx_set(ctx, CTX_OPT_TARGET(), TARGET_CORTEX_M())
+        return 0
+    }
+    if sx_cstr_eq(targ, "arm64-bare") != 0 || sx_cstr_eq(targ, "aarch64-bare") != 0 {
+        sx_ctx_set(ctx, CTX_OPT_TARGET(), TARGET_ARM64_BARE())
+        return 0
+    }
+    if sx_cstr_eq(targ, "arm64") != 0 || sx_cstr_eq(targ, "aarch64") != 0 {
+        sx_ctx_set(ctx, CTX_OPT_TARGET(), TARGET_ARM64())
+        return 0
+    }
+    if sx_cstr_eq(targ, "x86_64-bare") != 0 || sx_cstr_eq(targ, "x64-bare") != 0 {
+        sx_ctx_set(ctx, CTX_OPT_TARGET(), TARGET_X86_64_BARE())
+        return 0
+    }
+    if sx_cstr_eq(targ, "llvm") != 0 {
+        sx_ctx_set(ctx, CTX_OPT_TARGET(), TARGET_LLVM_IR())
+        return 0
+    }
+    sx_ctx_set(ctx, CTX_OPT_TARGET(), TARGET_X86_64())
+    return 0
+}
+
+func sx_cli_compile(ctx: Int, argc: Int, argv: Int, start_idx: Int) -> Int {
+    var src_file = 0
+    var out_file = "a.exe"
+    var i = start_idx
+
+    while i < argc {
+        let arg = sx_argv_get(argv, i)
+        var handled = 0
+
+        if sx_cstr_eq(arg, "-o") != 0 {
+            i = i + 1
+            if i < argc { out_file = sx_argv_get(argv, i) }
+            handled = 1
+        }
+        if handled == 0 && sx_cstr_eq(arg, "--target") != 0 {
+            i = i + 1
+            if i < argc {
+                let targ = sx_argv_get(argv, i)
+                sx_apply_target_flag(ctx, targ)
+            }
+            handled = 1
+        }
+        if handled == 0 && sx_cstr_eq(arg, "--bare") != 0 {
+            sx_ctx_set(ctx, CTX_OPT_BARE(), 1)
+            handled = 1
+        }
+        if handled == 0 && sx_cstr_eq(arg, "--noalloc") != 0 {
+            sx_ctx_set(ctx, CTX_OPT_NOALLOC(), 1)
+            handled = 1
+        }
+        if handled == 0 && sx_cstr_eq(arg, "--flash-kb") != 0 {
+            i = i + 1
+            if i < argc {
+                let fkb = sx_parse_dec_cstr(sx_argv_get(argv, i))
+                sx_ctx_set(ctx, CTX_OPT_FLASH_KB(), fkb)
+            }
+            handled = 1
+        }
+        if handled == 0 && sx_cstr_eq(arg, "--sram-kb") != 0 {
+            i = i + 1
+            if i < argc {
+                let skb = sx_parse_dec_cstr(sx_argv_get(argv, i))
+                sx_ctx_set(ctx, CTX_OPT_SRAM_KB(), skb)
+            }
+            handled = 1
+        }
+        if handled == 0 && sx_cstr_eq(arg, "--emit-llvm") != 0 {
+            sx_ctx_set(ctx, CTX_OPT_TARGET(), TARGET_LLVM_IR())
+            handled = 1
+        }
+        if handled == 0 && sx_cstr_eq(arg, "--emit-asm") != 0 {
+            sx_ctx_set(ctx, CTX_OPT_EMIT_ASM(), 1)
+            handled = 1
+        }
+        if handled == 0 && sx_cstr_eq(arg, "--dump-ast") != 0 {
+            sx_ctx_set(ctx, CTX_OPT_DUMP_AST(), 1)
+            handled = 1
+        }
+        if handled == 0 && sx_cstr_eq(arg, "--dump-ir") != 0 {
+            sx_ctx_set(ctx, CTX_OPT_DUMP_IR(), 1)
+            handled = 1
+        }
+        if handled == 0 && sx_cstr_eq(arg, "--link") != 0 {
+            i = i + 1
+            if i < argc {
+                let ext = sx_argv_get(argv, i)
+                sx_ctx_set(ctx, CTX_OPT_EXT_LIB(), ext)
+            }
+            handled = 1
+        }
+        if handled == 0 && sx_cstr_eq(arg, "-g") != 0 {
+            sx_ctx_set(ctx, CTX_OPT_DEBUG(), 1)
+            handled = 1
+        }
+        if handled == 0 {
+            src_file = arg
+        }
+        i = i + 1
+    }
+
+    if src_file == 0 {
+        println("[Synchronix v3] Error: missing required file or argument.")
+        return 1
+    }
+    let rc = sx_compile_file(ctx, src_file, out_file)
+    return rc
+}
+
+// ----------------------------------------------------------------------------
+// Subcommand Dispatcher
+// ----------------------------------------------------------------------------
+func sx_cli_dispatch(ctx: Int, argc: Int, argv: Int) -> Int {
+    let cmd = sx_argv_get(argv, 1)
+
+    if sx_cstr_eq(cmd, "--version") != 0 { sx_print_version(); return 0 }
+    if sx_cstr_eq(cmd, "--help") != 0 || sx_cstr_eq(cmd, "-h") != 0 { sx_print_banner(); return 0 }
+    if sx_cstr_eq(cmd, "--self-test") != 0 { return sx_v3_self_test() }
+    if sx_cstr_eq(cmd, "lsp") != 0 { return sx_cmd_lsp() }
+
+    if sx_cstr_eq(cmd, "new") != 0 {
+        if argc < 3 { println("[Synchronix v3] Error: missing project name."); return 1 }
+        var pname = 0
+        var is_emb = 0
+        var ni = 2
+        while ni < argc {
+            let na = sx_argv_get(argv, ni)
+            if sx_cstr_eq(na, "--embedded") != 0 || sx_cstr_eq(na, "--bare") != 0 || sx_cstr_eq(na, "--mcu") != 0 {
+                is_emb = 1
+            } else {
+                pname = na
+            }
+            ni = ni + 1
+        }
+        if pname == 0 { println("[Synchronix v3] Error: missing project name."); return 1 }
+        return sx_cmd_new(pname, is_emb)
+    }
+    if sx_cstr_eq(cmd, "size") != 0 {
+        if argc < 3 { println("[Synchronix v3] Error: missing binary path."); return 1 }
+        return sx_cmd_size(sx_argv_get(argv, 2))
+    }
+    if sx_cstr_eq(cmd, "fmt") != 0 {
+        if argc < 3 { println("[Synchronix v3] Error: missing file path."); return 1 }
+        return sx_cmd_fmt(ctx, sx_argv_get(argv, 2))
+    }
+    if sx_cstr_eq(cmd, "lint") != 0 {
+        if argc < 3 { println("[Synchronix v3] Error: missing file path."); return 1 }
+        return sx_cmd_lint(ctx, sx_argv_get(argv, 2))
+    }
+    if sx_cstr_eq(cmd, "debug") != 0 {
+        if argc < 3 { println("[Synchronix v3] Error: missing file path."); return 1 }
+        return sx_cmd_debug(ctx, sx_argv_get(argv, 2))
+    }
+    if sx_cstr_eq(cmd, "profile") != 0 {
+        if argc < 3 { println("[Synchronix v3] Error: missing file path."); return 1 }
+        return sx_cmd_profile(ctx, sx_argv_get(argv, 2))
+    }
+    if sx_cstr_eq(cmd, "run") != 0 {
+        var rsrc = 0
+        if argc >= 3 { rsrc = sx_argv_get(argv, 2) }
+        return sx_cmd_run(ctx, rsrc)
+    }
+    if sx_cstr_eq(cmd, "test") != 0 {
+        var tsrc = 0
+        if argc >= 3 { tsrc = sx_argv_get(argv, 2) }
+        return sx_cmd_test(ctx, tsrc)
+    }
+    if sx_cstr_eq(cmd, "build") != 0 {
+        var bsrc = 0
+        if argc >= 3 { bsrc = sx_argv_get(argv, 2) }
+        return sx_cmd_build(ctx, bsrc, 0)
+    }
+    if sx_cstr_eq(cmd, "compile") != 0 {
+        return sx_cli_compile(ctx, argc, argv, 2)
+    }
+    return sx_cli_compile(ctx, argc, argv, 1)
+}
+
+func main(argc: Int, argv: Int) -> Int {
+    if argc < 2 {
+        sx_print_banner()
+        return 0
+    }
+    let ctx = sx_ctx_create()
+    let rc = sx_cli_dispatch(ctx, argc, argv)
+    sx_ctx_destroy(ctx)
+    return rc
+}

@@ -1,0 +1,817 @@
+// SPDX-License-Identifier: Apache-2.0
+//
+// Copyright 2026 Synchronix Contributors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
+// Full license text: ../../LICENSE
+// End-User License Agreement: ../../EULA.md
+
+// ============================================================================
+// SYNCHRONIX v3.0.0 — Phase 1: Unified Recursive-Descent & Precedence Parser
+// (src/frontend/parser.synchronix)
+// ============================================================================
+// Full V2-parity Parser extended for Embedded Bare-Metal Hardware:
+//   - Swift/Kotlin syntax, Generics <T>, Phi contracts (requires/ensures/prove),
+//     Lambda closures (=> and |>), ARC/GC/Borrow/Move, M:N Async fibers
+//   - Embedded function qualifiers: irq func, noalloc func, bare func
+//   - Hardware intrinsics: mmio_read(addr), mmio_write(addr, val),
+//     irq_disable(), irq_enable(), wfi(), dmb()
+// ============================================================================
+
+import sx_defs
+import utils
+
+// ----------------------------------------------------------------------------
+// Token Stream Cursor Helpers
+// ----------------------------------------------------------------------------
+func sx_cur_tok_idx(ctx: Int) -> Int {
+    let p = sx_ctx_get(ctx, CTX_TOK_POS())
+    return p
+}
+
+func sx_peek_kind(ctx: Int) -> Int {
+    let p = sx_ctx_get(ctx, CTX_TOK_POS())
+    let k = sx_tok_get(ctx, p, TOK_KIND())
+    return k
+}
+
+func sx_peek_next_kind(ctx: Int) -> Int {
+    let p = sx_ctx_get(ctx, CTX_TOK_POS())
+    let cnt = sx_ctx_get(ctx, CTX_TOK_COUNT())
+    if p + 1 >= cnt {
+        return TK_EOF()
+    }
+    let k = sx_tok_get(ctx, p + 1, TOK_KIND())
+    return k
+}
+
+func sx_advance(ctx: Int) -> Int {
+    let p = sx_ctx_get(ctx, CTX_TOK_POS())
+    let k = sx_tok_get(ctx, p, TOK_KIND())
+    if k != TK_EOF() {
+        sx_ctx_set(ctx, CTX_TOK_POS(), p + 1)
+    }
+    return p
+}
+
+func sx_match(ctx: Int, expected: Int) -> Int {
+    let k = sx_peek_kind(ctx)
+    if k == expected {
+        sx_advance(ctx)
+        return 1
+    }
+    return 0
+}
+
+// ----------------------------------------------------------------------------
+// Type Annotation Parser: Int | Bool | String | Void | Reg32 | Generic <T>
+// ----------------------------------------------------------------------------
+func sx_parse_type(ctx: Int) -> Int {
+    let tidx = sx_advance(ctx)
+    let start = sx_tok_get(ctx, tidx, TOK_START())
+    let tlen = sx_tok_get(ctx, tidx, TOK_LEN())
+
+    if sx_slice_eq_cstr(ctx, start, tlen, "Int")    != 0 { return TY_INT() }
+    if sx_slice_eq_cstr(ctx, start, tlen, "Bool")   != 0 { return TY_BOOL() }
+    if sx_slice_eq_cstr(ctx, start, tlen, "String") != 0 { return TY_STR() }
+    if sx_slice_eq_cstr(ctx, start, tlen, "Void")   != 0 { return TY_VOID() }
+    if sx_slice_eq_cstr(ctx, start, tlen, "Reg32")  != 0 { return TY_REG32() }
+    return TY_GENERIC()
+}
+
+// ----------------------------------------------------------------------------
+// Primary Expression Parser Sub-Handlers (V2 + Embedded Hardware Intrinsics)
+// ----------------------------------------------------------------------------
+func sx_parse_lambda(ctx: Int, line: Int) -> Int {
+    sx_advance(ctx)
+    let node = sx_ast_new(ctx, NK_LAMBDA(), line)
+    sx_match(ctx, TK_LPAREN())
+    let pk = sx_peek_kind(ctx)
+    if pk == TK_IDENT() {
+        let ptok = sx_advance(ctx)
+        let ps = sx_tok_get(ctx, ptok, TOK_START())
+        let pl = sx_tok_get(ctx, ptok, TOK_LEN())
+        sx_ast_set(ctx, node, AST_NAME_START(), ps)
+        sx_ast_set(ctx, node, AST_NAME_LEN(), pl)
+        let has_col = sx_match(ctx, TK_COLON())
+        if has_col != 0 {
+            sx_parse_type(ctx)
+        }
+    }
+    sx_match(ctx, TK_RPAREN())
+    let has_fat = sx_match(ctx, TK_FATARROW())
+    if has_fat == 0 {
+        sx_match(ctx, TK_ARROW())
+    }
+    let body = sx_parse_expr(ctx)
+    sx_ast_set(ctx, node, AST_RIGHT(), body)
+    sx_ast_set(ctx, node, AST_TYPE(), TY_CLOSURE())
+    return node
+}
+
+func sx_parse_spawn(ctx: Int, line: Int) -> Int {
+    sx_advance(ctx)
+    let ftok = sx_advance(ctx)
+    let node = sx_ast_new(ctx, NK_SPAWN(), line)
+    let fs = sx_tok_get(ctx, ftok, TOK_START())
+    let fl = sx_tok_get(ctx, ftok, TOK_LEN())
+    sx_ast_set(ctx, node, AST_NAME_START(), fs)
+    sx_ast_set(ctx, node, AST_NAME_LEN(), fl)
+    sx_match(ctx, TK_LPAREN())
+    let pk = sx_peek_kind(ctx)
+    if pk != TK_RPAREN() {
+        let arg = sx_parse_expr(ctx)
+        sx_ast_set(ctx, node, AST_LEFT(), arg)
+    }
+    sx_match(ctx, TK_RPAREN())
+    sx_ast_set(ctx, node, AST_TYPE(), TY_TASK())
+    return node
+}
+
+func sx_parse_emb_intrinsic(ctx: Int, kind: Int, line: Int) -> Int {
+    sx_advance(ctx)
+    sx_match(ctx, TK_LPAREN())
+    if kind == TK_KW_MMIO_READ() {
+        let addr = sx_parse_expr(ctx)
+        sx_match(ctx, TK_RPAREN())
+        let nr = sx_ast_new(ctx, NK_MMIO_READ(), line)
+        sx_ast_set(ctx, nr, AST_LEFT(), addr)
+        sx_ast_set(ctx, nr, AST_TYPE(), TY_INT())
+        return nr
+    }
+    if kind == TK_KW_MMIO_WRITE() {
+        let addr2 = sx_parse_expr(ctx)
+        sx_match(ctx, TK_COMMA())
+        let val2 = sx_parse_expr(ctx)
+        sx_match(ctx, TK_RPAREN())
+        let nw = sx_ast_new(ctx, NK_MMIO_WRITE(), line)
+        sx_ast_set(ctx, nw, AST_LEFT(), addr2)
+        sx_ast_set(ctx, nw, AST_RIGHT(), val2)
+        sx_ast_set(ctx, nw, AST_TYPE(), TY_INT())
+        return nw
+    }
+    sx_match(ctx, TK_RPAREN())
+    if kind == TK_KW_IRQ_DISABLE() {
+        let nd = sx_ast_new(ctx, NK_IRQ_CTRL(), line)
+        sx_ast_set(ctx, nd, AST_IVAL(), 0)
+        sx_ast_set(ctx, nd, AST_TYPE(), TY_INT())
+        return nd
+    }
+    if kind == TK_KW_IRQ_ENABLE() {
+        let ne = sx_ast_new(ctx, NK_IRQ_CTRL(), line)
+        sx_ast_set(ctx, ne, AST_IVAL(), 1)
+        sx_ast_set(ctx, ne, AST_TYPE(), TY_INT())
+        return ne
+    }
+    if kind == TK_KW_WFI() {
+        let nwfi = sx_ast_new(ctx, NK_WFI(), line)
+        sx_ast_set(ctx, nwfi, AST_TYPE(), TY_INT())
+        return nwfi
+    }
+    let ndmb = sx_ast_new(ctx, NK_DMB(), line)
+    sx_ast_set(ctx, ndmb, AST_TYPE(), TY_INT())
+    return ndmb
+}
+
+func sx_parse_call_args(ctx: Int, call_node: Int) -> Int {
+    var tail = 0
+    var argc = 0
+    let pk = sx_peek_kind(ctx)
+    if pk == TK_RPAREN() {
+        sx_match(ctx, TK_RPAREN())
+        sx_ast_set(ctx, call_node, AST_IVAL(), 0)
+        return call_node
+    }
+    var more = 1
+    while more != 0 {
+        let arg = sx_parse_expr(ctx)
+        if tail == 0 {
+            sx_ast_set(ctx, call_node, AST_RIGHT(), arg)
+        } else {
+            sx_ast_set(ctx, tail, AST_NEXT(), arg)
+        }
+        tail = arg
+        argc = argc + 1
+        more = sx_match(ctx, TK_COMMA())
+    }
+    sx_match(ctx, TK_RPAREN())
+    sx_ast_set(ctx, call_node, AST_IVAL(), argc)
+    return call_node
+}
+
+func sx_parse_ident_or_call(ctx: Int, tidx: Int, line: Int) -> Int {
+    sx_advance(ctx)
+    var gen_ty = 0
+
+    let k_lt = sx_peek_kind(ctx)
+    if k_lt == TK_LT() {
+        let saved = sx_ctx_get(ctx, CTX_TOK_POS())
+        sx_advance(ctx)
+        let k_id = sx_peek_kind(ctx)
+        if k_id == TK_IDENT() {
+            let parsed_ty = sx_parse_type(ctx)
+            let k_gt = sx_peek_kind(ctx)
+            if k_gt == TK_GT() {
+                sx_advance(ctx)
+                let k_lp = sx_peek_kind(ctx)
+                if k_lp == TK_LPAREN() {
+                    gen_ty = parsed_ty
+                } else {
+                    sx_ctx_set(ctx, CTX_TOK_POS(), saved)
+                }
+            } else {
+                sx_ctx_set(ctx, CTX_TOK_POS(), saved)
+            }
+        } else {
+            sx_ctx_set(ctx, CTX_TOK_POS(), saved)
+        }
+    }
+
+    let ns = sx_tok_get(ctx, tidx, TOK_START())
+    let nl = sx_tok_get(ctx, tidx, TOK_LEN())
+    let k_lp2 = sx_peek_kind(ctx)
+    if k_lp2 == TK_LPAREN() {
+        sx_advance(ctx)
+        let call_n = sx_ast_new(ctx, NK_CALL(), line)
+        sx_ast_set(ctx, call_n, AST_NAME_START(), ns)
+        sx_ast_set(ctx, call_n, AST_NAME_LEN(), nl)
+        sx_ast_set(ctx, call_n, AST_EXTRA2(), gen_ty)
+        let done_c = sx_parse_call_args(ctx, call_n)
+        return done_c
+    }
+
+    let id_n = sx_ast_new(ctx, NK_IDENT(), line)
+    sx_ast_set(ctx, id_n, AST_NAME_START(), ns)
+    sx_ast_set(ctx, id_n, AST_NAME_LEN(), nl)
+    return id_n
+}
+
+func sx_parse_primary(ctx: Int) -> Int {
+    let tidx = sx_cur_tok_idx(ctx)
+    let kind = sx_tok_get(ctx, tidx, TOK_KIND())
+    let line = sx_tok_get(ctx, tidx, TOK_LINE())
+
+    if kind == TK_INT() {
+        sx_advance(ctx)
+        let n_int = sx_ast_new(ctx, NK_INT(), line)
+        let iv = sx_tok_get(ctx, tidx, TOK_IVAL())
+        sx_ast_set(ctx, n_int, AST_IVAL(), iv)
+        sx_ast_set(ctx, n_int, AST_TYPE(), TY_INT())
+        return n_int
+    }
+    if kind == TK_KW_TRUE() {
+        sx_advance(ctx)
+        let n_t = sx_ast_new(ctx, NK_INT(), line)
+        sx_ast_set(ctx, n_t, AST_IVAL(), 1)
+        sx_ast_set(ctx, n_t, AST_TYPE(), TY_BOOL())
+        return n_t
+    }
+    if kind == TK_KW_FALSE() {
+        sx_advance(ctx)
+        let n_f = sx_ast_new(ctx, NK_INT(), line)
+        sx_ast_set(ctx, n_f, AST_IVAL(), 0)
+        sx_ast_set(ctx, n_f, AST_TYPE(), TY_BOOL())
+        return n_f
+    }
+    if kind == TK_STR() {
+        sx_advance(ctx)
+        let n_s = sx_ast_new(ctx, NK_STR(), line)
+        let ss = sx_tok_get(ctx, tidx, TOK_START())
+        let sl = sx_tok_get(ctx, tidx, TOK_LEN())
+        sx_ast_set(ctx, n_s, AST_NAME_START(), ss)
+        sx_ast_set(ctx, n_s, AST_NAME_LEN(), sl)
+        sx_ast_set(ctx, n_s, AST_TYPE(), TY_STR())
+        return n_s
+    }
+    if kind == TK_LPAREN() {
+        sx_advance(ctx)
+        let inner = sx_parse_expr(ctx)
+        sx_match(ctx, TK_RPAREN())
+        return inner
+    }
+    if kind == TK_KW_ARC() {
+        sx_advance(ctx)
+        sx_match(ctx, TK_LPAREN())
+        let e_arc = sx_parse_expr(ctx)
+        sx_match(ctx, TK_RPAREN())
+        let n_arc = sx_ast_new(ctx, NK_ARC_NEW(), line)
+        sx_ast_set(ctx, n_arc, AST_LEFT(), e_arc)
+        sx_ast_set(ctx, n_arc, AST_TYPE(), TY_ARC())
+        return n_arc
+    }
+    if kind == TK_KW_GC() {
+        sx_advance(ctx)
+        sx_match(ctx, TK_LPAREN())
+        let e_gc = sx_parse_expr(ctx)
+        sx_match(ctx, TK_RPAREN())
+        let n_gc = sx_ast_new(ctx, NK_GC_NEW(), line)
+        sx_ast_set(ctx, n_gc, AST_LEFT(), e_gc)
+        sx_ast_set(ctx, n_gc, AST_TYPE(), TY_GC())
+        return n_gc
+    }
+    if kind == TK_KW_LAMBDA() {
+        let n_lam = sx_parse_lambda(ctx, line)
+        return n_lam
+    }
+    if kind == TK_KW_SPAWN() {
+        let n_sp = sx_parse_spawn(ctx, line)
+        return n_sp
+    }
+    if kind >= TK_KW_MMIO_READ() && kind <= TK_KW_DMB() {
+        let n_hw = sx_parse_emb_intrinsic(ctx, kind, line)
+        return n_hw
+    }
+    if kind == TK_IDENT() {
+        let n_id = sx_parse_ident_or_call(ctx, tidx, line)
+        return n_id
+    }
+
+    sx_error(ctx, line, "Parser: expected expression")
+    sx_advance(ctx)
+    let fallback = sx_ast_new(ctx, NK_INT(), line)
+    return fallback
+}
+
+// ----------------------------------------------------------------------------
+// Unary & Precedence-Layered Binary Expression Parsers
+// ----------------------------------------------------------------------------
+func sx_parse_unary(ctx: Int) -> Int {
+    let tidx = sx_cur_tok_idx(ctx)
+    let kind = sx_tok_get(ctx, tidx, TOK_KIND())
+    let line = sx_tok_get(ctx, tidx, TOK_LINE())
+
+    if kind == TK_MINUS() || kind == TK_BANG() {
+        sx_advance(ctx)
+        let opd = sx_parse_unary(ctx)
+        let n_un = sx_ast_new(ctx, NK_UNOP(), line)
+        sx_ast_set(ctx, n_un, AST_IVAL(), kind)
+        sx_ast_set(ctx, n_un, AST_LEFT(), opd)
+        return n_un
+    }
+    if kind == TK_KW_BORROW() || kind == TK_AMP() {
+        sx_advance(ctx)
+        let opb = sx_parse_unary(ctx)
+        let n_br = sx_ast_new(ctx, NK_BORROW(), line)
+        sx_ast_set(ctx, n_br, AST_LEFT(), opb)
+        return n_br
+    }
+    if kind == TK_KW_MOVE() {
+        sx_advance(ctx)
+        let opm = sx_parse_unary(ctx)
+        let n_mv = sx_ast_new(ctx, NK_MOVE(), line)
+        sx_ast_set(ctx, n_mv, AST_LEFT(), opm)
+        return n_mv
+    }
+    if kind == TK_KW_AWAIT() {
+        sx_advance(ctx)
+        let opa = sx_parse_unary(ctx)
+        let n_aw = sx_ast_new(ctx, NK_AWAIT(), line)
+        sx_ast_set(ctx, n_aw, AST_LEFT(), opa)
+        return n_aw
+    }
+    let prim = sx_parse_primary(ctx)
+    return prim
+}
+
+func sx_make_binop(ctx: Int, op: Int, lhs: Int, rhs: Int) -> Int {
+    let tidx = sx_cur_tok_idx(ctx)
+    let line = sx_tok_get(ctx, tidx, TOK_LINE())
+    let node = sx_ast_new(ctx, NK_BINOP(), line)
+    sx_ast_set(ctx, node, AST_IVAL(), op)
+    sx_ast_set(ctx, node, AST_LEFT(), lhs)
+    sx_ast_set(ctx, node, AST_RIGHT(), rhs)
+    return node
+}
+
+func sx_parse_mul(ctx: Int) -> Int {
+    var lhs = sx_parse_unary(ctx)
+    var loop_ok = 1
+    while loop_ok != 0 {
+        let k = sx_peek_kind(ctx)
+        if k == TK_STAR() || k == TK_SLASH() || k == TK_PERCENT() {
+            let op_t = sx_advance(ctx)
+            let op_ln = sx_tok_get(ctx, op_t, TOK_LINE())
+            let rhs = sx_parse_unary(ctx)
+            lhs = sx_make_binop(ctx, k, lhs, rhs)
+            sx_ast_set(ctx, lhs, AST_LINE(), op_ln)
+        } else {
+            loop_ok = 0
+        }
+    }
+    return lhs
+}
+
+func sx_parse_add(ctx: Int) -> Int {
+    var lhs = sx_parse_mul(ctx)
+    var loop_ok = 1
+    while loop_ok != 0 {
+        let k = sx_peek_kind(ctx)
+        if k == TK_PLUS() || k == TK_MINUS() {
+            let op_t = sx_advance(ctx)
+            let op_ln = sx_tok_get(ctx, op_t, TOK_LINE())
+            let rhs = sx_parse_mul(ctx)
+            lhs = sx_make_binop(ctx, k, lhs, rhs)
+            sx_ast_set(ctx, lhs, AST_LINE(), op_ln)
+        } else {
+            loop_ok = 0
+        }
+    }
+    return lhs
+}
+
+func sx_parse_cmp(ctx: Int) -> Int {
+    var lhs = sx_parse_add(ctx)
+    var loop_ok = 1
+    while loop_ok != 0 {
+        let k = sx_peek_kind(ctx)
+        let is_cmp = (k == TK_LT() || k == TK_LE() || k == TK_GT() || k == TK_GE() || k == TK_EQ() || k == TK_NE())
+        if is_cmp != 0 {
+            let op_t = sx_advance(ctx)
+            let op_ln = sx_tok_get(ctx, op_t, TOK_LINE())
+            let rhs = sx_parse_add(ctx)
+            lhs = sx_make_binop(ctx, k, lhs, rhs)
+            sx_ast_set(ctx, lhs, AST_LINE(), op_ln)
+        } else {
+            loop_ok = 0
+        }
+    }
+    return lhs
+}
+
+func sx_parse_logic(ctx: Int) -> Int {
+    var lhs = sx_parse_cmp(ctx)
+    var loop_ok = 1
+    while loop_ok != 0 {
+        let k = sx_peek_kind(ctx)
+        if k == TK_AND() || k == TK_OR() {
+            let op_t = sx_advance(ctx)
+            let op_ln = sx_tok_get(ctx, op_t, TOK_LINE())
+            let rhs = sx_parse_cmp(ctx)
+            lhs = sx_make_binop(ctx, k, lhs, rhs)
+            sx_ast_set(ctx, lhs, AST_LINE(), op_ln)
+        } else {
+            loop_ok = 0
+        }
+    }
+    return lhs
+}
+
+func sx_parse_expr(ctx: Int) -> Int {
+    var lhs = sx_parse_logic(ctx)
+    var loop_ok = 1
+    while loop_ok != 0 {
+        let k = sx_peek_kind(ctx)
+        if k == TK_PIPE() {
+            let tidx = sx_advance(ctx)
+            let line = sx_tok_get(ctx, tidx, TOK_LINE())
+            let ftok = sx_advance(ctx)
+            let fs = sx_tok_get(ctx, ftok, TOK_START())
+            let fl = sx_tok_get(ctx, ftok, TOK_LEN())
+            let call_n = sx_ast_new(ctx, NK_CALL(), line)
+            sx_ast_set(ctx, call_n, AST_NAME_START(), fs)
+            sx_ast_set(ctx, call_n, AST_NAME_LEN(), fl)
+            sx_ast_set(ctx, call_n, AST_RIGHT(), lhs)
+            sx_ast_set(ctx, call_n, AST_IVAL(), 1)
+            lhs = call_n
+        } else {
+            loop_ok = 0
+        }
+    }
+    return lhs
+}
+
+// ----------------------------------------------------------------------------
+// Statement & Block Parsers
+// ----------------------------------------------------------------------------
+func sx_parse_block(ctx: Int) -> Int {
+    let tidx = sx_cur_tok_idx(ctx)
+    let line = sx_tok_get(ctx, tidx, TOK_LINE())
+    sx_match(ctx, TK_LBRACE())
+    let blk = sx_ast_new(ctx, NK_BLOCK(), line)
+    var tail = 0
+    var loop_ok = 1
+
+    while loop_ok != 0 {
+        let k = sx_peek_kind(ctx)
+        if k == TK_RBRACE() || k == TK_EOF() {
+            loop_ok = 0
+        } else {
+            let st = sx_parse_stmt(ctx)
+            if st != 0 {
+                if tail == 0 {
+                    sx_ast_set(ctx, blk, AST_LEFT(), st)
+                } else {
+                    sx_ast_set(ctx, tail, AST_NEXT(), st)
+                }
+                tail = st
+            }
+        }
+    }
+    sx_match(ctx, TK_RBRACE())
+    return blk
+}
+
+func sx_parse_let_stmt(ctx: Int, is_mut: Int, line: Int) -> Int {
+    sx_advance(ctx)
+    let ntok = sx_advance(ctx)
+    let node = sx_ast_new(ctx, NK_LET(), line)
+    let ns = sx_tok_get(ctx, ntok, TOK_START())
+    let nl = sx_tok_get(ctx, ntok, TOK_LEN())
+    sx_ast_set(ctx, node, AST_NAME_START(), ns)
+    sx_ast_set(ctx, node, AST_NAME_LEN(), nl)
+    sx_ast_set(ctx, node, AST_IVAL(), is_mut)
+
+    let has_col = sx_match(ctx, TK_COLON())
+    if has_col != 0 {
+        let ty = sx_parse_type(ctx)
+        sx_ast_set(ctx, node, AST_TYPE(), ty)
+    }
+    sx_match(ctx, TK_ASSIGN())
+    let rhs = sx_parse_expr(ctx)
+    sx_ast_set(ctx, node, AST_LEFT(), rhs)
+    sx_match(ctx, TK_SEMI())
+    return node
+}
+
+func sx_parse_stmt(ctx: Int) -> Int {
+    let tidx = sx_cur_tok_idx(ctx)
+    let kind = sx_tok_get(ctx, tidx, TOK_KIND())
+    let line = sx_tok_get(ctx, tidx, TOK_LINE())
+
+    if kind == TK_KW_LET() || kind == TK_KW_CONST() {
+        let n_let = sx_parse_let_stmt(ctx, 0, line)
+        return n_let
+    }
+    if kind == TK_KW_VAR() || kind == TK_KW_VOLATILE() || kind == TK_KW_STATIC() {
+        let n_var = sx_parse_let_stmt(ctx, FL_MUT(), line)
+        return n_var
+    }
+    if kind == TK_KW_RETURN() {
+        sx_advance(ctx)
+        let n_ret = sx_ast_new(ctx, NK_RETURN(), line)
+        let pk = sx_peek_kind(ctx)
+        if pk != TK_RBRACE() && pk != TK_SEMI() {
+            let rv = sx_parse_expr(ctx)
+            sx_ast_set(ctx, n_ret, AST_LEFT(), rv)
+        }
+        sx_match(ctx, TK_SEMI())
+        return n_ret
+    }
+    if kind == TK_KW_IF() {
+        sx_advance(ctx)
+        let n_if = sx_ast_new(ctx, NK_IF(), line)
+        let cond = sx_parse_expr(ctx)
+        sx_ast_set(ctx, n_if, AST_LEFT(), cond)
+        let thn = sx_parse_block(ctx)
+        sx_ast_set(ctx, n_if, AST_RIGHT(), thn)
+        let has_else = sx_match(ctx, TK_KW_ELSE())
+        if has_else != 0 {
+            let els = sx_parse_block(ctx)
+            sx_ast_set(ctx, n_if, AST_EXTRA(), els)
+        }
+        return n_if
+    }
+    if kind == TK_KW_WHILE() {
+        sx_advance(ctx)
+        let n_wh = sx_ast_new(ctx, NK_WHILE(), line)
+        let wcond = sx_parse_expr(ctx)
+        sx_ast_set(ctx, n_wh, AST_LEFT(), wcond)
+        let wbody = sx_parse_block(ctx)
+        sx_ast_set(ctx, n_wh, AST_RIGHT(), wbody)
+        return n_wh
+    }
+    if kind == TK_KW_PROVE() || kind == TK_KW_INVARIANT() {
+        sx_advance(ctx)
+        let n_pr = sx_ast_new(ctx, NK_PROVE(), line)
+        let pe = sx_parse_expr(ctx)
+        sx_ast_set(ctx, n_pr, AST_LEFT(), pe)
+        sx_match(ctx, TK_SEMI())
+        return n_pr
+    }
+    if kind == TK_IDENT() {
+        let nk = sx_peek_next_kind(ctx)
+        if nk == TK_ASSIGN() {
+            let itok = sx_advance(ctx)
+            sx_advance(ctx)
+            let rhs = sx_parse_expr(ctx)
+            let n_as = sx_ast_new(ctx, NK_ASSIGN(), line)
+            let is_s = sx_tok_get(ctx, itok, TOK_START())
+            let is_l = sx_tok_get(ctx, itok, TOK_LEN())
+            sx_ast_set(ctx, n_as, AST_NAME_START(), is_s)
+            sx_ast_set(ctx, n_as, AST_NAME_LEN(), is_l)
+            sx_ast_set(ctx, n_as, AST_LEFT(), rhs)
+            sx_match(ctx, TK_SEMI())
+            return n_as
+        }
+    }
+
+    let expr = sx_parse_expr(ctx)
+    let n_es = sx_ast_new(ctx, NK_EXPR_STMT(), line)
+    sx_ast_set(ctx, n_es, AST_LEFT(), expr)
+    sx_match(ctx, TK_SEMI())
+    return n_es
+}
+
+// ----------------------------------------------------------------------------
+// Top-Level Declarations & Program Parser
+// ----------------------------------------------------------------------------
+func sx_parse_func_params(ctx: Int, fn_node: Int, line: Int) -> Int {
+    sx_match(ctx, TK_LPAREN())
+    var tail = 0
+    let pk = sx_peek_kind(ctx)
+    if pk == TK_RPAREN() {
+        sx_match(ctx, TK_RPAREN())
+        return 0
+    }
+    var more = 1
+    while more != 0 {
+        let ptok = sx_advance(ctx)
+        let pnode = sx_ast_new(ctx, NK_PARAM(), line)
+        let ps = sx_tok_get(ctx, ptok, TOK_START())
+        let pl = sx_tok_get(ctx, ptok, TOK_LEN())
+        sx_ast_set(ctx, pnode, AST_NAME_START(), ps)
+        sx_ast_set(ctx, pnode, AST_NAME_LEN(), pl)
+        sx_ast_set(ctx, pnode, AST_TYPE(), TY_INT())
+        let has_col = sx_match(ctx, TK_COLON())
+        if has_col != 0 {
+            let pty = sx_parse_type(ctx)
+            sx_ast_set(ctx, pnode, AST_TYPE(), pty)
+        }
+        if tail == 0 {
+            sx_ast_set(ctx, fn_node, AST_LEFT(), pnode)
+        } else {
+            sx_ast_set(ctx, tail, AST_NEXT(), pnode)
+        }
+        tail = pnode
+        more = sx_match(ctx, TK_COMMA())
+    }
+    sx_match(ctx, TK_RPAREN())
+    return 0
+}
+
+func sx_parse_func(ctx: Int, flags_in: Int) -> Int {
+    var flags = flags_in
+    let tidx = sx_cur_tok_idx(ctx)
+    let line = sx_tok_get(ctx, tidx, TOK_LINE())
+    sx_advance(ctx)
+
+    let ntok = sx_advance(ctx)
+    let fn_node = sx_ast_new(ctx, NK_FUNC(), line)
+    let ns = sx_tok_get(ctx, ntok, TOK_START())
+    let nl = sx_tok_get(ctx, ntok, TOK_LEN())
+    sx_ast_set(ctx, fn_node, AST_NAME_START(), ns)
+    sx_ast_set(ctx, fn_node, AST_NAME_LEN(), nl)
+
+    let has_gen = sx_match(ctx, TK_LT())
+    if has_gen != 0 {
+        flags = flags + FL_GENERIC()
+        sx_advance(ctx)
+        sx_match(ctx, TK_GT())
+    }
+    sx_ast_set(ctx, fn_node, AST_IVAL(), flags)
+
+    sx_parse_func_params(ctx, fn_node, line)
+
+    sx_ast_set(ctx, fn_node, AST_TYPE(), TY_INT())
+    let has_arr = sx_match(ctx, TK_ARROW())
+    if has_arr != 0 {
+        let rty = sx_parse_type(ctx)
+        sx_ast_set(ctx, fn_node, AST_TYPE(), rty)
+    }
+
+    var chk_c = 1
+    while chk_c != 0 {
+        let has_req = sx_match(ctx, TK_KW_REQUIRES())
+        if has_req != 0 {
+            let req_e = sx_parse_expr(ctx)
+            sx_ast_set(ctx, fn_node, AST_EXTRA(), req_e)
+        } else {
+            let has_ens = sx_match(ctx, TK_KW_ENSURES())
+            if has_ens != 0 {
+                let ens_e = sx_parse_expr(ctx)
+                sx_ast_set(ctx, fn_node, AST_EXTRA2(), ens_e)
+            } else {
+                chk_c = 0
+            }
+        }
+    }
+
+    let bk = sx_peek_kind(ctx)
+    if bk == TK_LBRACE() {
+        let body = sx_parse_block(ctx)
+        sx_ast_set(ctx, fn_node, AST_RIGHT(), body)
+    } else {
+        sx_match(ctx, TK_SEMI())
+    }
+    return fn_node
+}
+
+func sx_parse_phi_decl(ctx: Int) -> Int {
+    let tidx = sx_cur_tok_idx(ctx)
+    let line = sx_tok_get(ctx, tidx, TOK_LINE())
+    sx_advance(ctx)
+    let ntok = sx_advance(ctx)
+    sx_match(ctx, TK_ASSIGN())
+    let prop = sx_parse_expr(ctx)
+    let node = sx_ast_new(ctx, NK_PHI_DECL(), line)
+    let ns = sx_tok_get(ctx, ntok, TOK_START())
+    let nl = sx_tok_get(ctx, ntok, TOK_LEN())
+    sx_ast_set(ctx, node, AST_NAME_START(), ns)
+    sx_ast_set(ctx, node, AST_NAME_LEN(), nl)
+    sx_ast_set(ctx, node, AST_LEFT(), prop)
+    sx_match(ctx, TK_SEMI())
+    return node
+}
+
+func sx_parse_fn_modifiers(ctx: Int) -> Int {
+    var flags = 0
+    var more = 1
+    while more != 0 {
+        let k = sx_peek_kind(ctx)
+        var hit = 0
+        if k == TK_KW_ASYNC() {
+            sx_advance(ctx)
+            flags = flags || FL_ASYNC()
+            hit = 1
+        }
+        if hit == 0 && k == TK_KW_EXTERN() {
+            sx_advance(ctx)
+            flags = flags || FL_EXTERN()
+            hit = 1
+        }
+        if hit == 0 && k == TK_KW_IRQ() {
+            sx_advance(ctx)
+            flags = flags || FL_IRQ() || FL_NOALLOC()
+            hit = 1
+        }
+        if hit == 0 && k == TK_KW_NOALLOC() {
+            sx_advance(ctx)
+            flags = flags || FL_NOALLOC()
+            hit = 1
+        }
+        if hit == 0 && k == TK_KW_BARE() {
+            sx_advance(ctx)
+            flags = flags || FL_BARE()
+            hit = 1
+        }
+        if hit == 0 {
+            more = 0
+        }
+    }
+    return flags
+}
+
+func sx_parse_program(ctx: Int) -> Int {
+    sx_ctx_set(ctx, CTX_TOK_POS(), 0)
+    let root = sx_ast_new(ctx, NK_PROGRAM(), 1)
+    var tail = 0
+    var loop_ok = 1
+
+    while loop_ok != 0 {
+        let k0 = sx_peek_kind(ctx)
+        if k0 == TK_EOF() {
+            loop_ok = 0
+        } else {
+            let flags = sx_parse_fn_modifiers(ctx)
+            let k = sx_peek_kind(ctx)
+            var decl = 0
+            if k == TK_KW_FUNC() {
+                decl = sx_parse_func(ctx, flags)
+            } else {
+                if k == TK_KW_PHI() {
+                    decl = sx_parse_phi_decl(ctx)
+                } else {
+                    if k == TK_KW_IMPORT() {
+                        sx_advance(ctx)
+                        sx_advance(ctx)
+                        sx_match(ctx, TK_SEMI())
+                    } else {
+                        sx_advance(ctx)
+                    }
+                }
+            }
+            if decl != 0 {
+                if tail == 0 {
+                    sx_ast_set(ctx, root, AST_LEFT(), decl)
+                } else {
+                    sx_ast_set(ctx, tail, AST_NEXT(), decl)
+                }
+                tail = decl
+            }
+        }
+    }
+
+    sx_ctx_set(ctx, CTX_AST_ROOT(), root)
+    return root
+}
